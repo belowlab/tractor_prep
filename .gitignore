@@ -1,4 +1,6 @@
+nohup.out
 test_data/
+test_srcs/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
