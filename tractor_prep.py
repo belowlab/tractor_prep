@@ -100,9 +100,6 @@ class MSP(BaseVCF):
                 calls = r[6:]
                 X0.append(np.array(calls[0::2], dtype=np.int8))
                 X1.append(np.array(calls[1::2], dtype=np.int8))
-        index = np.stack(index)
-        X0 = np.stack(X0)
-        X1 = np.stack(X1)
         return cls(headers=headers, index=index, X0=X0, X1=X1)
 
     def to_tsv(self, path):
@@ -123,7 +120,9 @@ class MSPSwitches(BaseVCF):
     index_dtypes = tuple(MSP.index_dtypes)
 
     def __init__(self, index, switches, headers=None):
-        self.headers = np.asarray(headers or [])
+        if headers is None:
+            headers = []
+        self.headers = np.asarray(headers)
         self.index = np.asarray(index)
         self.switches = np.asarray(switches)
 
@@ -158,9 +157,6 @@ class PhasedVCF(BaseVCF):
                 calls = np.asarray([calls]).view('U1')
                 X0.append(calls[0::4] == '1')
                 X1.append(calls[2::4] == '1')
-        index = np.stack(index)
-        X0 = np.stack(X0)
-        X1 = np.stack(X1)
         return cls(headers=headers, index=index, X0=X0, X1=X1)
 
     def to_tsv(self, path):
@@ -202,7 +198,7 @@ class AncVCF(BaseVCF):
             for r in rows:
                 index.append(r[:5])
                 X.append(np.array(r[5:], dtype=np.int8))
-        return cls(headers=headers, index=np.stack(index), X=np.stack(X))
+        return cls(headers=headers, index=index, X=X)
 
     def to_tsv(self, path, compat=True):
         _headers = self.headers
