@@ -1,8 +1,15 @@
 """
 Convert RFMix outputs (VCF and MSP files) to Tractor inputs.
 """
+import builtins
+import contextlib
 import copy
+import io
+import itertools
 import numbers
+import operator
+import pathlib
+import shutil
 
 import numpy as np
 try:
@@ -12,8 +19,9 @@ except ImportError:
 
 
 __all__ = [
-    'get_file_headers',
-    'parse_file',
+    'read_iids',
+    'Reader',
+    'Writer',
     'BaseVCF',
     'MSP',
     'MSPSwitches',
@@ -26,22 +34,168 @@ __all__ = [
 ]
 
 
-def get_file_headers(file, char='#'):
-    """Extract the headers and move filestream to immediately after"""
-    tell = file.seek(0)
-    headers = []
-    while (line := file.readline()).startswith(char):
-        headers.append(line.strip())
-        tell = file.tell()
-    file.seek(tell)
-    return headers
+def read_iids(fname, header=False, sort=True):
+    """Convenience function for loading IID from file (one per line)"""
+    with open(fname, 'r') as file:
+        iids = [x.strip() for x in file]
+    if header:
+        iids = iids[1:]
+    if sort:
+        iids = sorted(iids)
+    return np.array(iids)
 
 
-def parse_file(file, char='#', split='\t', n=-1):
-    """Extract file headers and split remaining rows on tabs"""
-    headers = get_file_headers(file, char=char)
-    rows = (r.strip().split(split, n) for r in file)
+def zip_on_index(keys, its, index_fn):
+    """
+    Transforms a dictionary `its` of keys to iterators to a stream of values
+    from each iterator keyed by the provided `keys`, with a common index
+    provided by `index_fn`. Yields 2-tuples (index, values_dict).
+    """
+    for row_i in itertools.count(0):
+        row_index = None
+        row_value = {}
+        for k in keys:
+            try:
+                idx, row = index_fn(next(its[k]))
+            except StopIteration:
+                return
+            else:
+                if row_index is None:
+                    row_index = idx
+                elif row_index != idx:
+                    raise RuntimeError(f'Row Index {row_i} Mismatch')
+                row_value[k] = row
+        yield row_index, row_value
+
+
+def msp_fmt_iids(iids):
+    for ix in iids:
+        yield f'{ix}.0'
+        yield f'{ix}.1'
+
+
+class Reader:
+    def __init__(self, path, compress=False, buffer=False):
+        self.path = pathlib.Path(path).resolve()
+        self.compress = compress
+        self.buffer = buffer
+
+    def open(self):
+        match (self.buffer, self.compress):
+            case (True, True):
+                self._buff = io.BytesIO()
+                with builtins.open(self.path, 'rb') as src:
+                    shutil.copyfileobj(src, self._buff)
+                self._buff.seek(0)
+                self._file = gzip.open(self._buff, 'rt')
+            case (True, False):
+                self._file = io.StringIO()
+                with builtins.open(self.path, 'rt') as src:
+                    shutil.copyfileobj(src, self._file)
+                self._file.seek(0)
+            case (False, True):
+                self._file = gzip.open(self.path, 'rt')
+            case (False, False):
+                self._file = builtins.open(self.path, 'r')
+
+    def close(self):
+        with contextlib.suppress(AttributeError):
+            self._file.close()
+            self._buff.close()
+
+    def __enter__(self):
+        self.open()
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
+    def __iter__(self):
+        yield from self._file
+
+
+class Writer:
+    def __init__(self, path, compress=False, buffer=False):
+        self.path = path
+        self.compress = compress
+        self.buffer = buffer
+
+    def open(self):
+        match (self.buffer, self.compress):
+            case (True, True):
+                self._buff = io.BytesIO()
+                self._file = gzip.open(self._buff, 'wt')
+            case (True, False):
+                self._buff = io.BytesIO()
+                self._file = io.TextIOWrapper(self._buff)
+            case (False, True):
+                self._file = gzip.open(self.path, 'wt')
+            case (False, False):
+                self._file = builtins.open(self.path, 'wt')
+        self.write = self._file.write
+
+    def close(self):
+        def _write_buff():
+            self._buff.seek(0)
+            with builtins.open(self.path, 'wb') as disk:
+                shutil.copyfileobj(self._buff, disk)
+            self._buff.close()
+
+        # Very annoyingly, the order of closing file vs buff is different
+        match (self.buffer, self.compress):
+            case (True, True):
+                self._file.flush()
+                self._file.close()
+                _write_buff()
+            case (True, False):
+                self._file.flush()
+                _write_buff()
+                self._file.close()
+            case _:
+                self._file.close()
+
+    def __enter__(self):
+        self.open()
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
+
+def parse_reader(reader, char='#', split='\t', n=-1):
+    """Extracts headers and rows"""
+    reader = iter(reader)
+    if isinstance(char, numbers.Integral):
+        headers = [next(reader) for _ in range(char)]
+        peek = next(reader)
+    else:
+        headers = []
+        while (peek := next(reader)).startswith(char):
+            headers.append(peek)
+    headers = [h.strip() for h in headers]
+    rows = itertools.chain([peek], reader)
+    rows = (r.strip().split(split, n) for r in rows)
     return headers, rows
+
+
+def make_iid_header(obj, iids):
+    fields = [f'#{obj.index_fields[0]}']
+    fields.extend(obj.index_fields[1:])
+    fields.extend(tuple(iids))
+    return '\t'.join(fields)
+
+
+def write_headers(write, headers):
+    for h in headers:
+        write(h.strip())
+        write('\n')
+
+def write_idx_rows(write, idx, rows):
+    for ix, rx in zip(idx, rows):
+        write('\t'.join(ix))
+        write('\t')
+        write('\t'.join(rx))
+        write('\n')
 
 
 class BaseVCF:
@@ -68,33 +222,24 @@ class BaseVCF:
                 return False
         return True
 
-    def write_headers(self, file):
-        for line in self.headers:
-            file.write(line)
-            file.write('\n')
-
-    @staticmethod
-    def write_row(file, idx, row):
-        file.write('\t'.join(idx))
-        file.write('\t')
-        file.write('\t'.join(row))
-        file.write('\n')
-
-    @staticmethod
-    def write_rows(file, row_iter):
-        for idx, row in row_iter:
-            BaseVCF.write_row(file, idx, row)
-
 
 class MSP(BaseVCF):
     index_fields = ('chm', 'spos', 'epos', 'sgpos', 'egpos', 'n_snps')
     index_dtypes = (str, int, int, float, float, int)
 
+    @property
+    def iids(self):
+        if not hasattr(self, '_iids'):
+            raw = self.headers[-1].strip().split('\t')[6::2]
+            raw = [x.split('.')[0] for x in raw]
+            self._iids = np.array(raw)
+        return self._iids
+
     @classmethod
-    def from_tsv(cls, path):
+    def from_tsv(cls, path, compress=False, buffer=False):
         index, X0, X1 = [], [], []
-        with open(path, 'r') as file:
-            headers, rows = parse_file(file)
+        with Reader(path, compress, buffer) as reader:
+            headers, rows = parse_reader(reader)
             for r in rows:
                 index.append(r[:6])
                 calls = r[6:]
@@ -102,14 +247,62 @@ class MSP(BaseVCF):
                 X1.append(np.array(calls[1::2], dtype=np.int8))
         return cls(headers=headers, index=index, X0=X0, X1=X1)
 
-    def to_tsv(self, path):
+    def to_tsv(self, path, compress=False, buffer=False):
         m, n = self.X0.shape
         X = np.empty((m, 2*n), dtype=str)
         X[:, 0::2] = self.X0
         X[:, 1::2] = self.X1
-        with open(path, 'w') as file:
-            self.write_headers(file)
-            self.write_rows(file, zip(self.index, X))
+        with Writer(path, compress, buffer) as file:
+            write_headers(file.write, self.headers)
+            write_idx_rows(file.write, self.index, X)
+
+    def subset(self, iids):
+        """Produce a subset of this MSP filtered to specific iids"""
+        _, _, locs = np.intersect1d(iids, self.iids, return_indices=True)
+        *headers, _ = self.headers.tolist()
+        headers.append(make_iid_header(self, msp_fmt_iids(self.iids[locs])))
+        return self.__class__(headers=headers,
+                              index=np.copy(self.index),
+                              X0=np.copy(self.X0[:, locs]),
+                              X1=np.copy(self.X1[:, locs]))
+
+    def merge(self, other):
+        """Produce a single MSP by merging self with other"""
+        A_iids = np.copy(self.iids)
+        B_iids = np.copy(other.iids)
+        iids = np.concatenate((A_iids, B_iids))
+        sort = np.argsort(iids)
+        iids = iids[sort]
+
+        *headers, _ = self.headers.tolist()
+        headers.append(make_iid_header(self, msp_fmt_iids(iids)))
+
+        index, X0, X1 = [], [], []
+        A_zip = zip(self.index, self.X0, self.X1)
+        B_zip = zip(other.index, other.X0, other.X1)
+        A_idx, A_x0, A_x1 = next(A_zip, (None, None, None))
+        B_idx, B_x0, B_x1 = next(B_zip, (None, None, None))
+        while (A_idx is not None) and (B_idx is not None):
+            if A_idx[2] == B_idx[2]:
+                index.append(np.copy(A_idx))
+                X0.append(np.concatenate((A_x0, B_x0))[sort])
+                X1.append(np.concatenate((A_x1, B_x1))[sort])
+                A_idx, A_x0, A_x1 = next(A_zip, (None, None, None))
+                B_idx, B_x0, B_x1 = next(B_zip, (None, None, None))
+            elif int(A_idx[2]) > int(B_idx[2]):
+                index.append(np.copy(A_idx))
+                index[-1][2] = B_idx[2]
+                X0.append(np.concatenate((A_x0, B_x0))[sort])
+                X1.append(np.concatenate((A_x1, B_x1))[sort])
+                B_idx, B_x0, B_x1 = next(B_zip, (None, None, None))
+            else:
+                index.append(np.copy(A_idx))
+                X0.append(np.concatenate((A_x0, B_x0))[sort])
+                X1.append(np.concatenate((A_x1, B_x1))[sort])
+                A_idx, A_x0, A_x1 = next(A_zip, (None, None, None))
+        X0 = np.copy(np.asarray(X0), order='C')
+        X1 = np.copy(np.asarray(X1), order='C')
+        return self.__class__(headers=headers, index=index, X0=X0, X1=X1)
 
 
 class MSPSwitches(BaseVCF):
@@ -127,18 +320,19 @@ class MSPSwitches(BaseVCF):
         self.switches = np.asarray(switches)
 
     @classmethod
-    def from_tsv(cls, path):
+    def from_tsv(cls, path, compress=False, buffer=False):
         index, switches = [], []
-        with open(path, 'r') as file:
-            headers, rows = parse_file(file)
+        with Reader(path, compress, buffer) as reader:
+            headers, rows = parse_reader(reader)
             for r in rows:
                 index.append(r[:6])
                 switches.append(np.array(r[6:]) == 'True')
         return cls(headers=headers, index=index, switches=switches)
 
-    def to_tsv(self, path):
-        with open(path, 'w') as file:
-            self.write_rows(file, zip(self.index, self.switches.astype(str)))
+    def to_tsv(self, path, compress=False, buffer=False):
+        with Writer(path, compress, buffer) as file:
+            write_headers(file.write, self.headers)
+            write_idx_rows(file.write, self.index, self.switches.astype(str))
 
 
 class PhasedVCF(BaseVCF):
@@ -147,11 +341,17 @@ class PhasedVCF(BaseVCF):
                     'INFO', 'FORMAT')
     index_dtypes = (str, int, str, str, str, str, str, str, str)
 
+    @property
+    def iids(self):
+        if not hasattr(self, '_iids'):
+            self._iids = np.array(self.headers[-1].strip().split('\t')[9:])
+        return self._iids
+
     @classmethod
-    def from_tsv(cls, path):
+    def from_tsv(cls, path, compress=False, buffer=False):
         index, X0, X1 = [], [], []
-        with open(path, 'r') as file:
-            headers, rows = parse_file(file, n=9)
+        with Reader(path, compress, buffer) as reader:
+            headers, rows = parse_reader(reader, n=9)
             for *idx, calls in rows:
                 index.append(tuple(idx))
                 calls = np.asarray([calls]).view('U1')
@@ -159,20 +359,68 @@ class PhasedVCF(BaseVCF):
                 X1.append(calls[2::4] == '1')
         return cls(headers=headers, index=index, X0=X0, X1=X1)
 
-    def to_tsv(self, path):
+    def to_tsv(self, path, compress=False, buffer=False):
         X = np.full(4 * len(self.X0[0]), '0')
         X[1::4] = '|'
         X[3::4] = '\t'
         X[-1] = '\n'
         vtype = f'U{len(X)}'
-        with open(path, 'w') as file:
-            self.write_headers(file)
+        with Writer(path, compress, buffer) as file:
+            write_headers(file.write, self.headers)
             for idx, X0, X1 in zip(self.index, self.X0, self.X1):
                 X[0::4] = np.where(X0, '1', '0')
                 X[2::4] = np.where(X1, '1', '0')
                 file.write('\t'.join(idx))
                 file.write('\t')
                 file.write(X.view(vtype)[0])
+
+    @classmethod
+    def from_tsv_set(cls, paths, iid_path=None, compress=False, buffer=False):
+        """
+        Filters, merges, and sorts by sample id a set of VCF files with
+        identical index elements and non-overlapping sample ids.
+        """
+        row_iters = {}
+        file_iids = {}
+        all_iids = set()
+
+        with contextlib.ExitStack() as stack:
+            for p in paths:
+                s = stack.enter_context(Reader(p, compress, buffer))
+                headers, row_iters[p] = parse_reader(s, n=9)
+                file_iids[p] = np.array(headers[-1].strip().split('\t')[9:])
+                all_iids.update(file_iids[p])
+
+            if iid_path is not None:
+                ref_iids = read_iids(iid_path, sort=True)
+            else:
+                ref_iids = np.array(sorted(all_iids))
+
+            indices = {}
+            for p, iids in file_iids.items():
+                _, *idx = np.intersect1d(ref_iids, iids, return_indices=True)
+                indices[p] = idx
+
+            def index_fn(r):
+                # Strip the INFO and FORMAT fields (except 'GT')
+                # Equivalent to bcftools annotate -x INFO,FORMAT
+                return (*r[:7], '.', 'GT'), r[9]
+
+            index, X0, X1 = [], [], []
+            for idx, calld in zip_on_index(paths, row_iters, index_fn):
+                index.append(tuple(idx))
+                x0 = np.zeros(len(ref_iids), dtype=bool)
+                x1 = np.zeros(len(ref_iids), dtype=bool)
+                for k, calls in calld.items():
+                    ref_locs, iid_locs = indices[k]
+                    calls = np.asarray([calls]).view('U1')
+                    x0[ref_locs] = (calls[0::4] == '1')[iid_locs]
+                    x1[ref_locs] = (calls[2::4] == '1')[iid_locs]
+                X0.append(x0)
+                X1.append(x1)
+
+        headers = [make_iid_header(cls, ref_iids)]
+        return cls(headers=headers, index=index, X0=X0, X1=X1)
 
 
 class AncVCF(BaseVCF):
@@ -187,26 +435,24 @@ class AncVCF(BaseVCF):
         self.X = np.asarray(X)
 
     @classmethod
-    def from_tsv(cls, path, no_header_char=True):
+    def from_tsv(cls, path, compress=False, buffer=False, no_header_char=True):
         index, X = [], []
-        with open(path, 'r') as file:
-            if no_header_char:
-                headers = [file.readline().strip()]
-                rows = (r.strip().split('\t') for r in file)
-            else:
-                headers, rows = parse_file(file)
+        with Reader(path, compress, buffer) as reader:
+            char = 1 if no_header_char else '#'
+            headers, rows = parse_reader(reader, char=char)
             for r in rows:
                 index.append(r[:5])
                 X.append(np.array(r[5:], dtype=np.int8))
         return cls(headers=headers, index=index, X=X)
 
-    def to_tsv(self, path, compat=True):
-        _headers = self.headers
-        with open(path, 'w') as file:
+    def to_tsv(self, path, compress=False, buffer=False, compat=True):
+        with Writer(path, compress, buffer) as file:
             # Write headers (if compat, without the header char!)
             if compat:
-                self.headers = [h.lstrip('#') for h in self.headers]
-            self.write_headers(file)
+                headers = [h.lstrip('#') for h in self.headers]
+            else:
+                headers = self.headers
+            write_headers(file.write, headers)
 
             buff = np.full(2*self.X.shape[1], '\t')
             buff[-1] = '\n'
@@ -216,7 +462,6 @@ class AncVCF(BaseVCF):
                 file.write('\t')
                 buff[0::2] = row
                 file.write(buff.view(vtype)[0])
-        self.headers = _headers
 
 
 class MultiAncVCF(BaseVCF):

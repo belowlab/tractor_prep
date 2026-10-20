@@ -1,3 +1,4 @@
+*.out
 nohup.out
 test_data/
 test_srcs/
