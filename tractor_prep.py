@@ -1,15 +1,19 @@
 """
 Convert RFMix outputs (VCF and MSP files) to Tractor inputs.
 """
+import argparse
 import builtins
 import contextlib
 import copy
 import io
 import itertools
+import logging
 import numbers
 import operator
 import pathlib
 import shutil
+from argparse import ArgumentParser, BooleanOptionalAction
+from pathlib import Path
 
 import numpy as np
 try:
@@ -76,7 +80,7 @@ def msp_fmt_iids(iids):
 
 class Reader:
     def __init__(self, path, compress=False, buffer=False):
-        self.path = pathlib.Path(path).resolve()
+        self.path = Path(path).resolve()
         self.compress = compress
         self.buffer = buffer
 
@@ -256,15 +260,24 @@ class MSP(BaseVCF):
             write_headers(file.write, self.headers)
             write_idx_rows(file.write, self.index, X)
 
-    def subset(self, iids):
+    def subset(self, iids, inplace=False):
         """Produce a subset of this MSP filtered to specific iids"""
         _, _, locs = np.intersect1d(iids, self.iids, return_indices=True)
         *headers, _ = self.headers.tolist()
         headers.append(make_iid_header(self, msp_fmt_iids(self.iids[locs])))
-        return self.__class__(headers=headers,
-                              index=np.copy(self.index),
-                              X0=np.copy(self.X0[:, locs]),
-                              X1=np.copy(self.X1[:, locs]))
+        if inplace:
+            self.headers = headers
+            self.X0 = np.copy(self.X0[:, locs])
+            self.X1 = np.copy(self.X1[:, locs])
+            return self
+        else:
+            return self.__class__(headers=headers,
+                                  index=np.copy(self.index),
+                                  X0=np.copy(self.X0[:, locs]),
+                                  X1=np.copy(self.X1[:, locs]))
+
+    def sort_by_iids(self, inplace=False):
+        return self.subset(self.iids, inplace=inplace)
 
     def merge(self, other):
         """Produce a single MSP by merging self with other"""
@@ -277,6 +290,7 @@ class MSP(BaseVCF):
         *headers, _ = self.headers.tolist()
         headers.append(make_iid_header(self, msp_fmt_iids(iids)))
 
+        # XXX: verify the correctness of this algorithm!
         index, X0, X1 = [], [], []
         A_zip = zip(self.index, self.X0, self.X1)
         B_zip = zip(other.index, other.X0, other.X1)
@@ -292,6 +306,7 @@ class MSP(BaseVCF):
             elif int(A_idx[2]) > int(B_idx[2]):
                 index.append(np.copy(A_idx))
                 index[-1][2] = B_idx[2]
+                index[-1][4] = B_idx[4]
                 X0.append(np.concatenate((A_x0, B_x0))[sort])
                 X1.append(np.concatenate((A_x1, B_x1))[sort])
                 B_idx, B_x0, B_x1 = next(B_zip, (None, None, None))
@@ -434,6 +449,12 @@ class AncVCF(BaseVCF):
         self.index = np.asarray(index)
         self.X = np.asarray(X)
 
+    @property
+    def iids(self):
+        if not hasattr(self, '_iids'):
+            self._iids = np.array(self.headers[-1].strip().split('\t')[5:])
+        return self._iids
+
     @classmethod
     def from_tsv(cls, path, compress=False, buffer=False, no_header_char=True):
         index, X = [], []
@@ -445,7 +466,7 @@ class AncVCF(BaseVCF):
                 X.append(np.array(r[5:], dtype=np.int8))
         return cls(headers=headers, index=index, X=X)
 
-    def to_tsv(self, path, compress=False, buffer=False, compat=True):
+    def to_tsv(self, path, compress=False, buffer=False, compat=False):
         with Writer(path, compress, buffer) as file:
             # Write headers (if compat, without the header char!)
             if compat:
@@ -630,3 +651,169 @@ def extract_tracts(vcf, msp, ancestors, compat=True, compress=True):
 #        vcf_0.append(np.where(call_grid_a, geno_a, '.'))
 #        vcf_1.append(np.where(call_grid_b, geno_b, '.'))
     return header, index, ancestors, hap, dos
+
+
+def run_cli():
+    parser = ArgumentParser()
+    f = parser.add_argument
+
+    f('--vcf', required=True, action='append', type=Path,
+      help='Path to phased genotypes VCF file')
+
+    f('--msp', required=True, action='append', type=Path,
+      help='Path to ancestry calls MSP file')
+
+    f('--iids', type=Path,
+      help='IID file (one IID per line, no header)')
+
+#    # XXX: implement this? The results are different (annoyingly)
+#    f('--pre-merge', action=BooleanOptionalAction, default=False,
+#      help='Unkink MSP and VCF files *before* merging (if multiple given)')
+
+    f('--unkink-msp', action=BooleanOptionalAction, default=True,
+      help='Detect and correct strand flips in the RFMix MSP output')
+
+    f('--unkink-geno', action=BooleanOptionalAction, default=True,
+      help='Detect and correct strand flips in the RFMix VCF output')
+
+    f('--msp-compress', action=BooleanOptionalAction, default=False,
+      help='Assume the input MSP files are gzip compressed')
+
+    f('--vcf-compress', action=BooleanOptionalAction, default=True,
+      help='Assume the input VCF files are gzip compressed')
+
+    f('--buffer-input', action=BooleanOptionalAction, default=False,
+      help='Read the input files into memory before processing')
+
+    f('--buffer-output', action=BooleanOptionalAction, default=False,
+      help='Write the output files to a memory buffer before writing to disk')
+
+    f('--outdir', type=Path, default=Path().resolve(),
+      help='Directory in which to write outputs (created if non-existent)')
+
+    f('--ancestors', nargs='*', type=int,
+      help='Ancestral population(s) to extract from VCFs')
+
+    f('--num-ancestors', type=int,
+      help='Ancestral population(s) to extract from VCFs')
+
+    f('--write-msp-npz', action=BooleanOptionalAction, default=True,
+      help='Write Unkinked MSP and MSPSwitches as .npz files')
+
+    f('--write-vcf-npz', action=BooleanOptionalAction, default=True,
+      help='Write Unkinked Phased VCF as an .npz file')
+
+    f('--write-multi-anc-npz', action=BooleanOptionalAction, default=True,
+      help='Write extracted Ancestral tracts as a single .npz file')
+
+    f('--write-anc-tsv', action=BooleanOptionalAction, default=False,
+      help='Write each extracted Ancestral tracts as a .tsv file')
+
+    f('--write-anc-npz', action=BooleanOptionalAction, default=False,
+      help='Write each extracted Ancestral tracts as an .npz file')
+
+    f('--compress-ancs', action=BooleanOptionalAction, default=False,
+      help='Compress output ancestor *.tsv files (if writing any)')
+
+    f('--logging', action=BooleanOptionalAction, default=True,
+      help='Write a timestamped logfile inside the output directory')
+
+    # Process the arguments
+    args = parser.parse_args()
+    args.outdir.mkdir(parents=True, exist_ok=True)
+
+    if args.unkink_geno:
+        args.unkink_msp = True
+
+    if args.num_ancestors:
+        args.ancestors = list(range(args.num_ancestors))
+
+    if args.logging:
+        logging.basicConfig(filename=args.outdir/'extraction.log',
+                            level=logging.INFO,
+                            format='%(asctime)s %(name)s %(message)s',
+                            datefmt='%m/%d/%Y %I:%M:%S %p')
+
+    # Pretty-print the arguments
+    nsdict = vars(args)
+    fmt = f'>{max(len(k) for k in nsdict)}s'
+    for key, val in sorted(nsdict.items()):
+        logging.info('%s: %s', format(key, fmt), val)
+
+    #### Run the CLI App
+    if args.iids is not None:
+        logging.info(f'Reading IID file: {args.iids}')
+        iids = read_iids(args.iids)
+    else:
+        logging.info(f'Using IIDs in files')
+        iids = None
+
+    logging.info('Loading VCF file(s)')
+    kws = {'compress': args.vcf_compress, 'buffer': args.buffer_input}
+    if len(args.vcf) > 1:
+        vcf = PhasedVCF.from_tsv_set(args.vcf, args.iids, **kws)
+    else:
+        vcf = PhasedVCF.from_tsv(args.vcf[0], **kws)
+
+    logging.info('Loading MSP file(s)')
+    kws = {'compress': args.msp_compress, 'buffer': args.buffer_input}
+    msp = MSP.from_tsv(args.msp[0], **kws)
+    if iids is not None:
+        msp = msp.subset(iids)
+    for more_msp in args.msp[1:]:
+        new = MSP.from_tsv(more_msp, **kws)
+        if iids is not None:
+            new = new.subset(iids)
+        msp = msp.merge(new)
+
+    logging.info('Checking that IIDs match between MSP and VCF')
+    if not np.all(msp.iids == vcf.iids):
+        raise RuntimeError('IID mismatch between MSP and VCF files')
+
+    if args.unkink_msp:
+        logging.info('Unkinking MSP')
+        msp, switches = unkink_msp(msp)
+        if args.write_msp_npz:
+            logging.info('Writing Unkinked MSP and Switches .npz files')
+            msp.to_npz(args.outdir/'unkinked_msp.npz')
+            switches.to_npz(args.outdir/'unkinked_msp_switches.npz')
+
+    if args.unkink_geno:
+        logging.info('Unkinking Genotypes')
+        vcf = unkink_geno(vcf, switches)
+        if args.write_vcf_npz:
+            logging.info('Writing Unkinked Genotypes .npz file')
+            vcf.to_npz(args.outdir/'unkinked_vcf.npz')
+
+    logging.info('Extracting tracts')
+    tract_data = extract_tracts(vcf, msp, args.ancestors, compat=False)
+    multi_ancs = MultiAncVCF(*tract_data)
+
+    if args.write_multi_anc_npz:
+        logging.info('Persisting tracts npz')
+        multi_ancs.to_npz(args.outdir/'all_ancestor_tracts.npz')
+
+    if args.write_anc_npz or args.write_anc_tsv:
+        tsv_kws = {'compress': args.compress_ancs,
+                   'buffer': args.buffer_output}
+        for anc in args.ancestors:
+            hap = multi_ancs.get_anc(anc, 'hapcount')
+            dos = multi_ancs.get_anc(anc, 'dosage')
+            if args.write_anc_npz:
+                logging.info(f'Writing anc {anc} hapcount npz')
+                hap.to_npz(args.outdir/f'anc{anc}_hapcount.npz')
+
+                logging.info(f'Writing anc {anc} dosage npz')
+                dos.to_npz(args.outdir/f'anc{anc}_dosage.npz')
+
+            if args.write_anc_tsv:
+                logging.info(f'Writing anc {anc} hapcount tsv')
+                hap.to_tsv(args.outdir/f'anc{anc}_hapcount.tsv', **tsv_kws)
+
+                logging.info(f'Writing anc {anc} dosage tsv')
+                dos.to_tsv(args.outdir/f'anc{anc}_dosage.tsv', **tsv_kws)
+    logging.info('DONE')
+
+
+if __name__ == '__main__':
+    run_cli()
