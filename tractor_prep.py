@@ -676,6 +676,9 @@ def run_cli():
     f('--unkink-geno', action=BooleanOptionalAction, default=True,
       help='Detect and correct strand flips in the RFMix VCF output')
 
+    f('--extract', action=BooleanOptionalAction, default=True,
+      help='Extract tracts (requires --num-ancestors or --ancestors)')
+
     f('--msp-compress', action=BooleanOptionalAction, default=False,
       help='Assume the input MSP files are gzip compressed')
 
@@ -715,8 +718,9 @@ def run_cli():
     f('--compress-ancs', action=BooleanOptionalAction, default=False,
       help='Compress output ancestor *.tsv files (if writing any)')
 
-    f('--logging', action=BooleanOptionalAction, default=True,
-      help='Write a timestamped logfile inside the output directory')
+    f('--log', action='store_true', help='Write logs to stdout')
+    f('--log-file', help='Write logs to the given filename')
+    f('--dry-run', action='store_true', help='Log arguments and exit')
 
     # Process the arguments
     args = parser.parse_args()
@@ -728,8 +732,13 @@ def run_cli():
     if args.num_ancestors:
         args.ancestors = list(range(args.num_ancestors))
 
-    if args.logging:
-        logging.basicConfig(filename=args.outdir/'extraction.log',
+    if args.log or args.log_file:
+        if args.log_file:
+            filename = args.outdir/args.log_file
+        else:
+            # Logs to stream instead of file
+            filename = None
+        logging.basicConfig(filename=filename,
                             level=logging.INFO,
                             format='%(asctime)s %(name)s %(message)s',
                             datefmt='%m/%d/%Y %I:%M:%S %p')
@@ -739,6 +748,9 @@ def run_cli():
     fmt = f'>{max(len(k) for k in nsdict)}s'
     for key, val in sorted(nsdict.items()):
         logging.info('%s: %s', format(key, fmt), val)
+
+    if args.dry_run:
+        return
 
     #### Run the CLI App
     if args.iids is not None:
@@ -784,6 +796,10 @@ def run_cli():
         if args.write_vcf_npz:
             logging.info('Writing Unkinked Genotypes .npz file')
             vcf.to_npz(args.outdir/'unkinked_vcf.npz')
+
+    if not args.extract:
+        logging.info('DONE')
+        return
 
     logging.info('Extracting tracts')
     tract_data = extract_tracts(vcf, msp, args.ancestors, compat=False)
