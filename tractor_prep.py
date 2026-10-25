@@ -1,622 +1,235 @@
 """
-Convert RFMix outputs (VCF and MSP files) to Tractor inputs.
+Convert RFMix output MSPs and VCFs to Tractor input hapcount / dosage files.
 """
-import argparse
 import builtins
 import contextlib
-import copy
-import io
 import itertools
-import logging
-import numbers
-import operator
-import pathlib
-import shutil
+import sys
 from argparse import ArgumentParser, BooleanOptionalAction
 from pathlib import Path
+from pprint import pprint
 
 import numpy as np
 try:
-    from isal import igzip as gzip
+    from isal.igzip_threaded import open as gzip_open
+    HAS_ISAL = True
 except ImportError:
-    import gzip
+    from gzip import open as gzip_open
+    HAS_ISAL = False
 
 
-__all__ = [
-    'read_iids',
-    'Reader',
-    'Writer',
-    'BaseVCF',
-    'MSP',
-    'MSPSwitches',
-    'PhasedVCF',
-    'AncVCF',
-    'MultiAncVCF',
-    'unkink_msp',
-    'unkink_geno',
-    'extract_tracts',
-]
-
-
-def read_iids(fname, header=False, sort=True):
-    """Convenience function for loading IID from file (one per line)"""
-    with open(fname, 'r') as file:
-        iids = [x.strip() for x in file]
-    if header:
-        iids = iids[1:]
-    if sort:
-        iids = sorted(iids)
-    return np.array(iids)
-
-
-def zip_on_index(keys, its, index_fn):
-    """
-    Transforms a dictionary `its` of keys to iterators to a stream of values
-    from each iterator keyed by the provided `keys`, with a common index
-    provided by `index_fn`. Yields 2-tuples (index, values_dict).
-    """
-    for row_i in itertools.count(0):
-        row_index = None
-        row_value = {}
-        for k in keys:
-            try:
-                idx, row = index_fn(next(its[k]))
-            except StopIteration:
-                return
-            else:
-                if row_index is None:
-                    row_index = idx
-                elif row_index != idx:
-                    raise RuntimeError(f'Row Index {row_i} Mismatch')
-                row_value[k] = row
-        yield row_index, row_value
-
-
-def msp_fmt_iids(iids):
-    for ix in iids:
-        yield f'{ix}.0'
-        yield f'{ix}.1'
-
-
-class Reader:
-    def __init__(self, path, compress=False, buffer=False):
-        self.path = Path(path).resolve()
-        self.compress = compress
-        self.buffer = buffer
-
-    def open(self):
-        match (self.buffer, self.compress):
-            case (True, True):
-                self._buff = io.BytesIO()
-                with builtins.open(self.path, 'rb') as src:
-                    shutil.copyfileobj(src, self._buff)
-                self._buff.seek(0)
-                self._file = gzip.open(self._buff, 'rt')
-            case (True, False):
-                self._file = io.StringIO()
-                with builtins.open(self.path, 'rt') as src:
-                    shutil.copyfileobj(src, self._file)
-                self._file.seek(0)
-            case (False, True):
-                self._file = gzip.open(self.path, 'rt')
-            case (False, False):
-                self._file = builtins.open(self.path, 'r')
-
-    def close(self):
-        with contextlib.suppress(AttributeError):
-            self._file.close()
-            self._buff.close()
-
-    def __enter__(self):
-        self.open()
-        return self
-
-    def __exit__(self, *exc):
-        self.close()
-
-    def __iter__(self):
-        yield from self._file
-
-
-class Writer:
-    def __init__(self, path, compress=False, buffer=False):
-        self.path = path
-        self.compress = compress
-        self.buffer = buffer
-
-    def open(self):
-        match (self.buffer, self.compress):
-            case (True, True):
-                self._buff = io.BytesIO()
-                self._file = gzip.open(self._buff, 'wt')
-            case (True, False):
-                self._buff = io.BytesIO()
-                self._file = io.TextIOWrapper(self._buff)
-            case (False, True):
-                self._file = gzip.open(self.path, 'wt')
-            case (False, False):
-                self._file = builtins.open(self.path, 'wt')
-        self.write = self._file.write
-
-    def close(self):
-        def _write_buff():
-            self._buff.seek(0)
-            with builtins.open(self.path, 'wb') as disk:
-                shutil.copyfileobj(self._buff, disk)
-            self._buff.close()
-
-        # Very annoyingly, the order of closing file vs buff is different
-        match (self.buffer, self.compress):
-            case (True, True):
-                self._file.flush()
-                self._file.close()
-                _write_buff()
-            case (True, False):
-                self._file.flush()
-                _write_buff()
-                self._file.close()
-            case _:
-                self._file.close()
-
-    def __enter__(self):
-        self.open()
-        return self
-
-    def __exit__(self, *exc):
-        self.close()
-
-
-def parse_reader(reader, char='#', split='\t', n=-1):
-    """Extracts headers and rows"""
-    reader = iter(reader)
-    if isinstance(char, numbers.Integral):
-        headers = [next(reader) for _ in range(char)]
-        peek = next(reader)
+def read_file(filename, opener=builtins.open):
+    """Read the contents of a (maybe compressed) file or stdin"""
+    # If we're being piped to or otherwise want to read stdin, read stdin
+    if (filename == '-') or (filename == 'stdin'):
+        yield from sys.stdin.buffer
     else:
-        headers = []
-        while (peek := next(reader)).startswith(char):
-            headers.append(peek)
-    headers = [h.strip() for h in headers]
-    rows = itertools.chain([peek], reader)
-    rows = (r.strip().split(split, n) for r in rows)
-    return headers, rows
+        with opener(filename, 'rb') as file:
+            yield from file
 
 
-def make_iid_header(obj, iids):
-    fields = [f'#{obj.index_fields[0]}']
-    fields.extend(obj.index_fields[1:])
-    fields.extend(tuple(iids))
-    return '\t'.join(fields)
+def bytes_to_ords(bts, *, cols=Ellipsis, rows=4, stride=2):
+    """Process a line of formatted chars into shaped single byte integers.
+
+    E.g., if `bts` is something like `b'0|0\t0|1\t...'`
+    The output with default kwargs is an ndarray: `[[0, 0, ...], [0, 1, ...]]`
+    """
+    # `frombuffer` of memoryview before reshaping etc; `copy` after. The copy
+    # *does* make all downstream operations significantly faster.
+    bts = memoryview(bts)
+    bts = np.frombuffer(bts, dtype=np.int8)
+    # .squeeze() In case the rows/stride combination selects a single row.
+    bts = bts.reshape(-1, rows).T[::stride, cols].squeeze()
+    bts = np.copy(bts, order='c')
+    # ord(b'0') == 48: so if we subtract 48, then we cast from b'0' to 0, etc.
+    np.subtract(bts, 48, bts)
+    return bts
 
 
-def write_headers(write, headers):
-    for h in headers:
-        write(h.strip())
-        write('\n')
-
-def write_idx_rows(write, idx, rows):
-    for ix, rx in zip(idx, rows):
-        write('\t'.join(ix))
-        write('\t')
-        write('\t'.join(rx))
-        write('\n')
+def process_iid_header(line, splitfn, cohort=None):
+    """Process the header line into fields, iids, and iid cohort col indices"""
+    index, iids = splitfn(line.strip().split(b'\t'))
+    if cohort is not None:
+        _, cols, _ = np.intersect1d(iids, cohort, return_indices=True)
+        iids = np.copy(iids[cols], order='c')
+    else:
+        cols = Ellipsis
+    return index, iids, cols
 
 
-class BaseVCF:
-    fields = ('headers', 'index', 'X0', 'X1')
+def parse_msp(stream, cohort=None):
+    """Parse an iterator of newline-terminated byte as MSP window data"""
+    def header_fn(parts):
+        iids = np.array([x.strip().split(b'.')[0] for x in parts[6::2]])
+        return tuple(parts[:6]), iids
 
-    def __init__(self, headers, index, X0, X1):
-        self.headers = np.asarray(headers)
-        self.index = np.asarray(index)
-        self.X0 = np.asarray(X0)
-        self.X1 = np.asarray(X1)
+    for line in (next(stream), next(stream)):
+        if line.startswith(b'#Subpopulation'):
+            pass
+        elif line.startswith(b'#chm'):
+            index, iids, cols = process_iid_header(line, header_fn, cohort)
+            yield index, iids
+            break
 
-    @classmethod
-    def from_npz(cls, path):
-        data = np.load(path, allow_pickle=True)
-        return cls(**{k: data[k] for k in cls.fields})
-
-    def to_npz(self, path):
-        output = {k: getattr(self, k) for k in self.fields}
-        np.savez_compressed(path, **output)
-
-    def __eq__(self, other):
-        for field in self.fields:
-            if not np.array_equal(getattr(self, field), getattr(other, field)):
-                return False
-        return True
+    for line in stream:
+        # Do *not* strip the line: the final \n is required for the reshaping.
+        *idx, calls = line.split(b'\t', 6)
+        calls = bytes_to_ords(calls, cols=cols, rows=4, stride=2)
+        yield idx, calls
 
 
-class MSP(BaseVCF):
-    index_fields = ('chm', 'spos', 'epos', 'sgpos', 'egpos', 'n_snps')
-    index_dtypes = (str, int, int, float, float, int)
+def parse_vcf(stream, cohort=None, flare=False):
+    """Parse an iterator of newline-terminated bytes as Phased Genotypes"""
+    def header_fn(parts):
+        return tuple(parts[:5]), np.array(parts[9:])
 
-    @property
-    def iids(self):
-        if not hasattr(self, '_iids'):
-            raw = self.headers[-1].strip().split('\t')[6::2]
-            raw = [x.split('.')[0] for x in raw]
-            self._iids = np.array(raw)
-        return self._iids
+    for line in stream:
+        # Skip the bcftools VCF headers
+        if line.startswith(b'##'):
+            continue
+        # Emit the header with the 5 kept field names and IIDs
+        elif line.startswith(b'#'):
+            index, iids, cols = process_iid_header(line, header_fn, cohort)
+            yield index, iids
+            break
+    ## This is how to make an array for checking the cell format (not impl.)
+    ## XXX: checking would be pricy - double call time - maybe as an assert?
+    ## Then could be run with the python "strip asserts" optimization mode.
+    # seps = np.array(list(map(ord, b'|::\t')), dtype=np.int8)    # FLARE
+    # seps = np.array(list(map(ord, b'|\t')), dtype=np.int8)      # RFMix
 
-    @classmethod
-    def from_tsv(cls, path, compress=False, buffer=False):
-        index, X0, X1 = [], [], []
-        with Reader(path, compress, buffer) as reader:
-            headers, rows = parse_reader(reader)
-            for r in rows:
-                index.append(r[:6])
-                calls = r[6:]
-                X0.append(np.array(calls[0::2], dtype=np.int8))
-                X1.append(np.array(calls[1::2], dtype=np.int8))
-        return cls(headers=headers, index=index, X0=X0, X1=X1)
+    # RFMix: Cell format is GT0|GT1\t (4 bytes). Reshape to 4 rows, then
+    #   rows 0 and 2 are GT0 and GT1, while rows 1 and 3 are '|' and
+    #   whitespace.
+    # FLARE: Cell format is GT0|GT1:ANC0:ANC1\t (8 bytes). Reshape to 8
+    #   rows then rows 1, 3, 5, 7 should be identically '|', ':', ':', and
+    #   whitespace, while rows 0, 2, 4, and 6 are GT0, GT1, ANC0, and ANC1.
+    rows = 8 if flare else 4
 
-    def to_tsv(self, path, compress=False, buffer=False):
-        m, n = self.X0.shape
-        X = np.empty((m, 2*n), dtype=str)
-        X[:, 0::2] = self.X0
-        X[:, 1::2] = self.X1
-        with Writer(path, compress, buffer) as file:
-            write_headers(file.write, self.headers)
-            write_idx_rows(file.write, self.index, X)
-
-    def subset(self, iids, inplace=False):
-        """Produce a subset of this MSP filtered to specific iids"""
-        _, _, locs = np.intersect1d(iids, self.iids, return_indices=True)
-        *headers, _ = self.headers.tolist()
-        headers.append(make_iid_header(self, msp_fmt_iids(self.iids[locs])))
-        if inplace:
-            self.headers = headers
-            self.X0 = np.copy(self.X0[:, locs])
-            self.X1 = np.copy(self.X1[:, locs])
-            return self
-        else:
-            return self.__class__(headers=headers,
-                                  index=np.copy(self.index),
-                                  X0=np.copy(self.X0[:, locs]),
-                                  X1=np.copy(self.X1[:, locs]))
-
-    def sort_by_iids(self, inplace=False):
-        return self.subset(self.iids, inplace=inplace)
-
-    def merge(self, other):
-        """Produce a single MSP by merging self with other"""
-        A_iids = np.copy(self.iids)
-        B_iids = np.copy(other.iids)
-        iids = np.concatenate((A_iids, B_iids))
-        sort = np.argsort(iids)
-        iids = iids[sort]
-
-        *headers, _ = self.headers.tolist()
-        headers.append(make_iid_header(self, msp_fmt_iids(iids)))
-
-        # XXX: verify the correctness of this algorithm!
-        index, X0, X1 = [], [], []
-        A_zip = zip(self.index, self.X0, self.X1)
-        B_zip = zip(other.index, other.X0, other.X1)
-        A_idx, A_x0, A_x1 = next(A_zip, (None, None, None))
-        B_idx, B_x0, B_x1 = next(B_zip, (None, None, None))
-        while (A_idx is not None) and (B_idx is not None):
-            if A_idx[2] == B_idx[2]:
-                index.append(np.copy(A_idx))
-                X0.append(np.concatenate((A_x0, B_x0))[sort])
-                X1.append(np.concatenate((A_x1, B_x1))[sort])
-                A_idx, A_x0, A_x1 = next(A_zip, (None, None, None))
-                B_idx, B_x0, B_x1 = next(B_zip, (None, None, None))
-            elif int(A_idx[2]) > int(B_idx[2]):
-                index.append(np.copy(A_idx))
-                index[-1][2] = B_idx[2]
-                index[-1][4] = B_idx[4]
-                X0.append(np.concatenate((A_x0, B_x0))[sort])
-                X1.append(np.concatenate((A_x1, B_x1))[sort])
-                B_idx, B_x0, B_x1 = next(B_zip, (None, None, None))
-            else:
-                index.append(np.copy(A_idx))
-                X0.append(np.concatenate((A_x0, B_x0))[sort])
-                X1.append(np.concatenate((A_x1, B_x1))[sort])
-                A_idx, A_x0, A_x1 = next(A_zip, (None, None, None))
-        X0 = np.copy(np.asarray(X0), order='C')
-        X1 = np.copy(np.asarray(X1), order='C')
-        return self.__class__(headers=headers, index=index, X0=X0, X1=X1)
+    for line in stream:
+        # Do *not* strip the line: the final \n is required for the reshaping.
+        # Keep the first 5 fields; ditch QUAL, FILTER, INFO, and FORMAT
+        *idx, _, _, _, _, calls = line.split(b'\t', 9)
+        calls = bytes_to_ords(calls, cols=cols, rows=rows, stride=2)
+        yield idx, calls
 
 
-class MSPSwitches(BaseVCF):
-    # The original switches files don't have any header at all - but there's no
-    # harm in keeping the header with the sample IID information if available.
-    fields = ('headers', 'index', 'switches')
-    index_fields = tuple(MSP.index_fields)
-    index_dtypes = tuple(MSP.index_dtypes)
+def parse_anc(stream, cohort=None):
+    """Parse and iterator of dosage / hapcount byte rows"""
+    def header_fn(parts):
+        return tuple(parts[:5]), np.array(parts[5:])
 
-    def __init__(self, index, switches, headers=None):
-        if headers is None:
-            headers = []
-        self.headers = np.asarray(headers)
-        self.index = np.asarray(index)
-        self.switches = np.asarray(switches)
+    # First line is always the header. NOTE: header not always b'#' prefixed!
+    index, iids, cols = process_iid_header(next(stream), header_fn, cohort)
+    yield index, iids
 
-    @classmethod
-    def from_tsv(cls, path, compress=False, buffer=False):
-        index, switches = [], []
-        with Reader(path, compress, buffer) as reader:
-            headers, rows = parse_reader(reader)
-            for r in rows:
-                index.append(r[:6])
-                switches.append(np.array(r[6:]) == 'True')
-        return cls(headers=headers, index=index, switches=switches)
-
-    def to_tsv(self, path, compress=False, buffer=False):
-        with Writer(path, compress, buffer) as file:
-            write_headers(file.write, self.headers)
-            write_idx_rows(file.write, self.index, self.switches.astype(str))
+    for line in stream:
+        *idx, calls = line.split(b'\t', 5)
+        calls = bytes_to_ords(calls, cols=cols, rows=2, stride=2)
+        yield idx, calls
 
 
-class PhasedVCF(BaseVCF):
-    """Wraps conversion and manipulation functions for an Phased VCF file"""
-    index_fields = ('CHROM', 'POS', 'ID', 'REF', 'ALT', 'QUAL', 'FILTER',
-                    'INFO', 'FORMAT')
-    index_dtypes = (str, int, str, str, str, str, str, str, str)
+def unkink_msp(stream):
+    """Detect and correct strand flips in an RFMix MSP windows file.
 
-    @property
-    def iids(self):
-        if not hasattr(self, '_iids'):
-            self._iids = np.array(self.headers[-1].strip().split('\t')[9:])
-        return self._iids
+    The input stream is (index, call data) tuples.
+    The output stream is (index, call data, switched flags) tuples.
+    """
+    idx, iids = next(stream)
+    yield idx, iids
 
-    @classmethod
-    def from_tsv(cls, path, compress=False, buffer=False):
-        index, X0, X1 = [], [], []
-        with Reader(path, compress, buffer) as reader:
-            headers, rows = parse_reader(reader, n=9)
-            for *idx, calls in rows:
-                index.append(tuple(idx))
-                calls = np.asarray([calls]).view('U1')
-                X0.append(calls[0::4] == '1')
-                X1.append(calls[2::4] == '1')
-        return cls(headers=headers, index=index, X0=X0, X1=X1)
-
-    def to_tsv(self, path, compress=False, buffer=False):
-        X = np.full(4 * len(self.X0[0]), '0')
-        X[1::4] = '|'
-        X[3::4] = '\t'
-        X[-1] = '\n'
-        vtype = f'U{len(X)}'
-        with Writer(path, compress, buffer) as file:
-            write_headers(file.write, self.headers)
-            for idx, X0, X1 in zip(self.index, self.X0, self.X1):
-                X[0::4] = np.where(X0, '1', '0')
-                X[2::4] = np.where(X1, '1', '0')
-                file.write('\t'.join(idx))
-                file.write('\t')
-                file.write(X.view(vtype)[0])
-
-    @classmethod
-    def from_tsv_set(cls, paths, iid_path=None, compress=False, buffer=False):
-        """
-        Filters, merges, and sorts by sample id a set of VCF files with
-        identical index elements and non-overlapping sample ids.
-        """
-        row_iters = {}
-        file_iids = {}
-        all_iids = set()
-
-        with contextlib.ExitStack() as stack:
-            for p in paths:
-                s = stack.enter_context(Reader(p, compress, buffer))
-                headers, row_iters[p] = parse_reader(s, n=9)
-                file_iids[p] = np.array(headers[-1].strip().split('\t')[9:])
-                all_iids.update(file_iids[p])
-
-            if iid_path is not None:
-                ref_iids = read_iids(iid_path, sort=True)
-            else:
-                ref_iids = np.array(sorted(all_iids))
-
-            indices = {}
-            for p, iids in file_iids.items():
-                _, *idx = np.intersect1d(ref_iids, iids, return_indices=True)
-                indices[p] = idx
-
-            def index_fn(r):
-                # Strip the INFO and FORMAT fields (except 'GT')
-                # Equivalent to bcftools annotate -x INFO,FORMAT
-                return (*r[:7], '.', 'GT'), r[9]
-
-            index, X0, X1 = [], [], []
-            for idx, calld in zip_on_index(paths, row_iters, index_fn):
-                index.append(tuple(idx))
-                x0 = np.zeros(len(ref_iids), dtype=bool)
-                x1 = np.zeros(len(ref_iids), dtype=bool)
-                for k, calls in calld.items():
-                    ref_locs, iid_locs = indices[k]
-                    calls = np.asarray([calls]).view('U1')
-                    x0[ref_locs] = (calls[0::4] == '1')[iid_locs]
-                    x1[ref_locs] = (calls[2::4] == '1')[iid_locs]
-                X0.append(x0)
-                X1.append(x1)
-
-        headers = [make_iid_header(cls, ref_iids)]
-        return cls(headers=headers, index=index, X0=X0, X1=X1)
-
-
-class AncVCF(BaseVCF):
-    """Used for `*.hapcount.tsv` and `*.dosage.tsv` files"""
-    fields = ('headers', 'index', 'X')
-    index_fields = ('CHROM', 'POS', 'ID', 'REF', 'ALT')
-    index_dtypes = (str, int, str, str, str)
-
-    def __init__(self, headers, index, X):
-        self.headers = np.asarray(headers)
-        self.index = np.asarray(index)
-        self.X = np.asarray(X)
-
-    @property
-    def iids(self):
-        if not hasattr(self, '_iids'):
-            self._iids = np.array(self.headers[-1].strip().split('\t')[5:])
-        return self._iids
-
-    @classmethod
-    def from_tsv(cls, path, compress=False, buffer=False, no_header_char=True):
-        index, X = [], []
-        with Reader(path, compress, buffer) as reader:
-            char = 1 if no_header_char else '#'
-            headers, rows = parse_reader(reader, char=char)
-            for r in rows:
-                index.append(r[:5])
-                X.append(np.array(r[5:], dtype=np.int8))
-        return cls(headers=headers, index=index, X=X)
-
-    def to_tsv(self, path, compress=False, buffer=False, compat=False):
-        with Writer(path, compress, buffer) as file:
-            # Write headers (if compat, without the header char!)
-            if compat:
-                headers = [h.lstrip('#') for h in self.headers]
-            else:
-                headers = self.headers
-            write_headers(file.write, headers)
-
-            buff = np.full(2*self.X.shape[1], '\t')
-            buff[-1] = '\n'
-            vtype = f'U{len(buff)}'
-            for idx, row in zip(self.index, self.X):
-                file.write('\t'.join(idx))
-                file.write('\t')
-                buff[0::2] = row
-                file.write(buff.view(vtype)[0])
-
-
-class MultiAncVCF(BaseVCF):
-    """Stores Ancestor VCF hapcount & dosage files with a common index"""
-    fields = ('headers', 'index', 'ancestors', 'hapcounts', 'dosages')
-    index_fields = ('CHROM', 'POS', 'ID', 'REF', 'ALT')
-    index_dtypes = (str, int, str, str, str)
-
-    def __init__(self, headers, index, ancestors, hapcounts, dosages):
-        self.headers = np.asarray(headers)
-        self.index = np.asarray(index)
-        self.ancestors = np.asarray(ancestors)
-        self.hapcounts = np.asarray(hapcounts)
-        self.dosages = np.asarray(dosages)
-        self._ancidx = {v: i for i, v in enumerate(ancestors)}
-
-    def get_anc(self, anc, which='hapcount'):
-        idx = self._ancidx[anc]
-        match which:
-            case 'hapcount':
-                X = self.hapcounts[:, idx]
-            case 'dosage':
-                X = self.dosages[:, idx]
-            case _:
-                raise ValueError(f'{which=} must be "hapcount" or "dosage"')
-        return AncVCF(headers=self.headers, index=self.index, X=X)
-
-
-def unkink_msp(msp, inplace=False, compat=True):
-    if not inplace:
-        msp = copy.deepcopy(msp)
-    assert msp.X0.shape == msp.X1.shape
-    assert len(msp.X0) == len(msp.index)
-    start = msp.index[:, 3].astype(float) - 1.0
-    egpos = msp.index[:, 4].astype(float)
-    S = np.zeros(msp.X0.shape, dtype=bool)
-
-    m, n = msp.X0.shape
+    n = len(iids)
     prev_start = np.zeros(n, dtype=float)
-    prev_a = np.zeros(n, dtype=msp.X0.dtype)
-    prev_b = np.zeros(n, dtype=msp.X1.dtype)
+    prev_a = np.zeros(n, dtype=np.int8)
+    prev_b = np.zeros(n, dtype=np.int8)
     switched = np.zeros(n, dtype=bool)
 
-    for i in range(m):
+    for idx, (a, b) in stream:
+        start = np.float64(idx[3]) - 1.0
+        egpos = np.float64(idx[4])
         # copies have to be made so the switcheroo is not befuddled by mutation
-        a = np.copy(msp.X0[i])
-        b = np.copy(msp.X1[i])
         update_mask = (a != b)
         change_mask = (a != prev_a) | (b != prev_b)
-        starts_mask = (start[i] < prev_start)
+        starts_mask = (start < prev_start)
         sm = (update_mask & change_mask & starts_mask)
         switched[sm] = np.logical_not(switched[sm])
         # Update state tracking ndarrays
-        prev_start[update_mask] = egpos[i]
+        prev_start[update_mask] = egpos
         prev_a[update_mask] = a[update_mask]
         prev_b[update_mask] = b[update_mask]
         # Perform the switch
-        S[i] = switched
-        msp.X0[i, switched] = b[switched]
-        msp.X1[i, switched] = a[switched]
-
-    # For some reason the original script removes the other header lines
-    if compat:
-        msp.headers = msp.headers[1:]
-
-    switches = MSPSwitches(index=np.copy(msp.index), switches=S)
-    return msp, switches
+        a_out = np.where(switched, b, a)
+        b_out = np.where(switched, a, b)
+        yield idx, (a_out, b_out), switched
 
 
-def unkink_geno(vcf, switches, inplace=False):
-    if not inplace:
-        vcf = copy.deepcopy(vcf)
+def _check_stream_iids(vcf_stream, msp_stream, check_iids=True):
+    """Raise an error if the IIDs do not match"""
+    vcf_head, vcf_iids = next(vcf_stream)
+    msp_head, msp_iids = next(msp_stream)
+    # This is undefined if not the case. Use assert anyway?
+    if check_iids and not np.all(vcf_iids == msp_iids):
+        raise ValueError('VCF and MSP iids do not match')
+    return vcf_head, vcf_iids
 
-    def _iter_windows():
-        for idx, S in zip(switches.index, switches.switches):
-            yield idx[0], int(idx[1]), int(idx[2]), S
-    iter_windows = _iter_windows()
-    chrom, start, stop, mask = next(iter_windows)
 
-    for i, idx in enumerate(vcf.index):
-        pos = int(idx[1])
-        while not (idx[0] == chrom and (start <= pos < stop)):
+def unkink_vcf(vcf_stream, msp_stream, check_iids=True):
+    """
+    Use switches and MSP windows from msp_stream to detect and correct strand
+    flips in a Phased Genotypes in vcf_stream (a parsed Phased VCF file).
+
+    Arguments
+    ---------
+    vcf_stream: iterator of (idx, (geno_a, geno_b)) tuples
+    msp_stream: iterator of (idx, (call_a, call_b), switched) tuples
+    check_iids: bool
+
+    Yields first (VCF field header tuple, VCF IID ndarray)
+    Yields after that (idx, (geno_a, geno_b)
+    """
+    yield _check_stream_iids(vcf_stream, msp_stream, check_iids=check_iids)
+
+    windows = ((idx[0], int(idx[1]), int(idx[2]), switched)
+               for idx, _, switched in iter(msp_stream))
+    chrom, start, stop, switched = next(windows)
+
+    for vcf_idx, (a, b) in vcf_stream:
+        pos = int(vcf_idx[1])
+        while not (vcf_idx[0] == chrom and (start <= pos < stop)):
             try:
-                chrom, start, stop, mask = next(iter_windows)
+                chrom, start, stop, switched = next(windows)
             except StopIteration:
                 break
-        a = np.copy(vcf.X0[i, mask])
-        b = np.copy(vcf.X1[i, mask])
-        vcf.X0[i, mask] = b
-        vcf.X1[i, mask] = a
-    return vcf
+        a_out = np.where(switched, b, a)
+        b_out = np.where(switched, a, b)
+        yield vcf_idx, (a_out, b_out)
 
 
-def extract_tracts(vcf, msp, ancestors, compat=True, compress=True):
-    # TODO: choose method for implementing `compress`
-    # sanity check the data shapes
-    assert vcf.X0.shape == vcf.X1.shape
-    assert msp.X0.shape == msp.X1.shape
-    assert vcf.X0.shape[1] == msp.X0.shape[1]
-    assert len(vcf.index) == vcf.X0.shape[0]
-    assert len(msp.index) == msp.X0.shape[0]
-    n_iids = vcf.X0.shape[1]
+def _hap_and_dos(geno_a, geno_b, call_a, call_b, call_grid):
+    # Get the haplotype counts
+    call_grid_a = (call_a == call_grid)
+    call_grid_b = (call_b == call_grid)
+    hap_cts = call_grid_a.view(np.int8) + call_grid_b.view(np.int8)
 
-    # Get the output header for the dosage / hapcount files
-    header = vcf.headers[-1].strip()
-    # For some reason the original strips out the '#' header marker char
-    if compat:
-        header = header.lstrip('#')
-    header = header.split('\t', 9)
-    header = np.array(['\t'.join(header[:5] + header[9:])])
+    # Get the dosage counts
+    geno_grid_a = (geno_a.view(bool) & call_grid_a)
+    geno_grid_b = (geno_b.view(bool) & call_grid_b)
+    dos_cts = geno_grid_a.view(np.int8) + geno_grid_b.view(np.int8)
+    return hap_cts, dos_cts
 
-    def _iter_windows():
-        for idx, x0, x1 in zip(msp.index, msp.X0, msp.X1):
-            yield idx[0], int(idx[1]), int(idx[2]), x0, x1
-    iter_windows = _iter_windows()
-    msp_chrom, start, stop, call_a, call_b = next(iter_windows)
 
-    # XXX: "output ancestry-specific VCF" - should we bother keeping?
-    vcf_0 = []
-    vcf_1 = []
-    vcf_index = []
+def extract_rfmix(vcf_stream, msp_stream, ancestors, check_iids=True):
+    vcf_head, vcf_iids = _check_stream_iids(vcf_stream, msp_stream, check_iids)
+    yield vcf_head, vcf_iids
 
-    # TODO: use gzip with BytesIO to incrementally compress the objects in mem?
-    hap = []
-    dos = []
-    index = []
+    ancestors = np.asarray(ancestors).reshape(-1, 1).astype(np.int8)
+    call_grid = np.tile(ancestors, len(vcf_iids))
 
-    # numbers.Integral will catch python int but also np.int<8|16|etc> types
-    if isinstance(ancestors, numbers.Integral):
-        ancestors = np.arange(ancestors)
-    ancestors = np.asarray(ancestors)
-    call_grid = np.tile(ancestors.reshape(-1, 1), n_iids)
+    windows = ((idx[0], int(idx[1]), int(idx[2]), call_a, call_b)
+               for idx, (call_a, call_b), *_ in iter(msp_stream))
+    msp_chrom, start, stop, call_a, call_b = next(windows)
 
-    for idx, geno_a, geno_b in zip(vcf.index, vcf.X0, vcf.X1):
+    for idx, (geno_a, geno_b) in vcf_stream:
         # First align the VCF and MSP: the VCF site must be in an MSP window
         vcf_chrom, pos = str(idx[0]), int(idx[1])
         if vcf_chrom == msp_chrom and pos < start:
@@ -624,7 +237,7 @@ def extract_tracts(vcf, msp, ancestors, compat=True, compress=True):
         skip_line = False
         while not (vcf_chrom == msp_chrom and (start <= pos < stop)):
             try:
-                msp_chrom, start, stop, call_a, call_b = next(iter_windows)
+                msp_chrom, start, stop, call_a, call_b = next(windows)
             except StopIteration:
                 break
             if vcf_chrom == msp_chrom and pos < start:
@@ -633,203 +246,387 @@ def extract_tracts(vcf, msp, ancestors, compat=True, compress=True):
         if skip_line:
             continue
 
-        # If we're processing the row, save the right index parts
-        index.append(tuple(idx[:5]))
+#        # Get the haplotype counts
+#        call_grid_a = (call_a == call_grid)
+#        call_grid_b = (call_b == call_grid)
+#        hap_cts = call_grid_a.view(np.int8) + call_grid_b.view(np.int8)
+#
+#        # Get the dosage counts
+#        geno_grid_a = (geno_a.view(bool) & call_grid_a)
+#        geno_grid_b = (geno_b.view(bool) & call_grid_b)
+#        dos_cts = geno_grid_a.view(np.int8) + geno_grid_b.view(np.int8)
 
-        # Get the haplotype counts
-        call_grid_a = (call_a == call_grid)
-        call_grid_b = (call_b == call_grid)
-        hap_cts = call_grid_a.astype(np.int8) + call_grid_b.astype(np.int8)
-        hap.append(hap_cts)
-
-        # Get the dosage counts
-        geno_grid_a = (geno_a & call_grid_a)
-        geno_grid_b = (geno_b & call_grid_b)
-        dos_cts = geno_grid_a.astype(np.int8) + geno_grid_b.astype(np.int8)
-        dos.append(dos_cts)
-
-#        vcf_0.append(np.where(call_grid_a, geno_a, '.'))
-#        vcf_1.append(np.where(call_grid_b, geno_b, '.'))
-    return header, index, ancestors, hap, dos
+        hap, dos = _hap_and_dos(geno_a, geno_b, call_a, call_b, call_grid)
+        yield idx, hap, dos
 
 
-def run_cli():
+def extract_flare(stream, ancestors):
+    # Emit the header line, and learn the size of the call grid from it
+    idx, iids = next(stream)
+    yield idx, iids
+
+    ancestors = np.asarray(ancestors).reshape(-1, 1).astype(np.int8)
+    call_grid = np.tile(ancestors, len(iids))
+
+    for (idx, calls) in stream:
+        #geno_a, geno_b, call_a, call_b = calls
+#        # XXX: This part of the algo is identical in both funcs. Should I
+#        # extract it? Will adding another layer of function call in this loop
+#        # affect the runtime very much at all?
+#
+#        # Get the haplotype counts
+#        call_grid_a = (call_a == call_grid)
+#        call_grid_b = (call_b == call_grid)
+#        hap_cts = call_grid_a.view(np.int8) + call_grid_b.view(np.int8)
+#
+#        # Get the dosage counts
+#        geno_grid_a = (geno_a.view(bool) & call_grid_a)
+#        geno_grid_b = (geno_b.view(bool) & call_grid_b)
+#        dos_cts = geno_grid_a.view(np.int8) + geno_grid_b.view(np.int8)
+        # `calls` ought to have four rows (shape [4, n_iids]: see parse_anc)
+        hap, dos = _hap_and_dos(*calls, call_grid)
+        yield idx, hap, dos
+
+
+def write_tracts(stream, hap_files, dos_files, header_char=True):
+    """Consume tract data from stream and write to all input files in tandem"""
+    idx, iids = next(stream)
+
+    # Handle compatibility with respect to the header char '#'... the original
+    # does not use '#' to prefix the header for the dosage / hapcount files.
+    if not header_char:
+        idx = (idx[0].lstrip(b'#'), *idx[1:])
+    elif not idx[0].startswith(b'#'):
+        idx = (b'#'+idx[0], *idx[1:])
+
+    header = b'\t'.join(itertools.chain(idx, iids))
+    for file in itertools.chain(hap_files, dos_files):
+        file.write(header)
+        file.write(b'\n')
+
+    # Make a line buffer
+    sbuff = np.full(2*len(iids), ord(b'\t'), dtype=np.int8)
+    sbuff[-1] = ord(b'\n')
+    n_anc = len(hap_files)
+    for (idx, hap, dos) in stream:
+        hap_ords = hap + 48
+        dos_ords = dos + 48
+        index = b'\t'.join(idx)
+        for i in range(n_anc):
+            hap_files[i].write(index)
+            hap_files[i].write(b'\t')
+            sbuff[::2] = hap_ords[i]
+            hap_files[i].write(sbuff)
+
+            dos_files[i].write(index)
+            dos_files[i].write(b'\t')
+            sbuff[::2] = dos_ords[i]
+            dos_files[i].write(sbuff)
+
+
+def hstack_ancs(streams, sort=True, check_overlap=True, check_index=True):
+    """
+    Given N input streams with identical index fields and non-overlapping
+    sample ids, merge the columns of the input streams.
+    """
+    streams = tuple(streams)
+    if len(streams) < 2:
+        raise ValueError('Not enough streams to merge')
+
+    fields, iids = zip(*[next(s) for s in streams])
+    if not np.all(fields[0] == np.array(fields[1:])):
+        raise ValueError('Header index field mismatch')
+
+    iids = np.concatenate(iids)
+    if check_overlap and not np.all(np.sort(iids) == np.unique(iids)):
+        raise ValueError('Overlapping sample ids')
+
+    if sort:
+        reorder = np.argsort(iids)
+        iids = iids[reorder]
+
+    yield fields[0], iids
+    while True:
+        try:
+            rows = [next(s) for s in streams]
+        except StopIteration:
+            break
+        else:
+            idx, vals = zip(*rows)
+            if check_index:
+                idx_arr = np.array(idx)
+                if not np.all(idx_arr[0] == idx_arr[1:]):
+                    raise ValueError('Index mismatch')
+            vals = np.concatenate(vals)
+            if sort:
+                vals = vals[reorder]
+            yield idx[0], vals
+
+
+def write_msp(stream, msp_name, switch_name, opener=builtins.open):
+    """Write unkinked MSP stream to file and forward to consumer function."""
+    # XXX: function is assumed to be called with unkink_msp stream as input
+    with opener(msp_name, 'wb') as file, opener(switch_name, 'wb') as sw_file:
+        # Write the MSP header, ignoring the Subpopulations header
+        fields, iids = next(stream)
+        if not fields[0].startswith(b'#'):
+            file.write(b'#')
+        # MSP-format the IID byte strings
+        msp_iids = ((ix + b'.0', ix + b'.1') for ix in iids)
+        msp_iids = itertools.chain.from_iterable(msp_iids)
+        file.write(b'\t'.join(itertools.chain(fields, msp_iids)))
+        file.write(b'\n')
+        # Finally remember to pass the header data through
+        yield fields, iids
+
+        sbuff = np.full(4*len(iids), ord(b'\t'), dtype=np.int8)
+        sbuff[-1] = ord(b'\n')
+        for idx, (call_a, call_b), switches in stream:
+            idx_bts = b'\t'.join(idx)
+            # Write to the unkinked MSP file
+            sbuff[0::4] = call_a + 48
+            sbuff[2::4] = call_b + 48
+            file.write(idx_bts)
+            file.write(b'\t')
+            file.write(sbuff)
+            # Write to the switches file
+            sw_file.write(idx_bts)
+            sw_file.write(b'\t')
+            sw_file.write(b'\t'.join(switches.astype('S5')))
+            sw_file.write(b'\n')
+            yield idx, (call_a, call_b), switches
+
+
+def write_vcf(stream, filename, opener=builtins.open):
+    """Write unkinked VCF stream to file and forward to consumer function"""
+    with opener(filename, 'wb') as file:
+        fields, iids = next(stream)
+        if not fields[0].startswith(b'#'):
+            file.write(b'#')
+        file.write(b'\t'.join(itertools.chain(fields, iids)))
+        file.write(b'\n')
+        yield fields, iids
+
+        sbuff = np.full(4*len(iids), ord(b'\t'), dtype=np.int8)
+        sbuff[1::4] = ord(b'|')
+        sbuff[-1] = ord(b'\n')
+        for idx, (geno_a, geno_b) in stream:
+            sbuff[0::4] = geno_a + 48
+            sbuff[2::4] = geno_b + 48
+            file.write(b'\t'.join(idx))
+            # Write The next four header fields: QUAL, FILTER, INFO, FORMAT.
+            # These are stripped out when we parse the file (they are not
+            # involved in the ANC hapcount / dosage outputs).
+            file.write(b'\t.\t.\t.\tGT\t')
+            file.write(sbuff)
+            yield idx, (geno_a, geno_b)
+
+
+def write_anc(stream, filename, opener=builtins.open):
+    """
+    Write a single dosage / hapcount stream to a file. Used to write the
+    output of, e.g., hstack_ancs, and *not* the output(s) of extract_ancestors.
+    """
+    with opener(filename, 'wb') as file:
+        fields, iids = next(stream)
+        file.write(b'\t'.join(itertools.chain(fields, iids)))
+        file.write(b'\n')
+
+        sbuff = np.full(2*len(iids), ord(b'\t'), dtype=np.int8)
+        sbuff[-1] = ord(b'\n')
+        for idx, vals in stream:
+            file.write(b'\t'.join(idx))
+            file.write(b'\t')
+            sbuff[::2] = vals + 48
+            file.write(sbuff)
+
+
+def cli():
     parser = ArgumentParser()
-    f = parser.add_argument
+    subparsers = parser.add_subparsers(dest='command')
+    parser_rfmix = subparsers.add_parser('extract_rfmix')
+    parser_flare = subparsers.add_parser('extract_flare')
+    parser_merge = subparsers.add_parser('merge_tracts')
+    all_parsers = (parser, parser_rfmix, parser_flare, parser_merge)
 
-    f('--vcf', required=True, action='append', type=Path,
-      help='Path to phased genotypes VCF file')
+    # RFMix specific arguments
+    f = parser_rfmix.add_argument
+    f('vcf', type=str, help='Path to Phased VCF genotypes file')
+    f('--msp', type=Path, help='Path to RFMix MSP file')
+    f('--msp-gzip', action=BooleanOptionalAction, default=False,
+      help='Input MSP is GZIP compressed')
+    f('--unkink', action=BooleanOptionalAction, default=True,
+      help='Correct RFMix strand flips')
+    f('--emit-msp', action=BooleanOptionalAction, default=True,
+      help='Write unkinked MSP file')
+    f('--emit-vcf', action=BooleanOptionalAction, default=True,
+      help='Write unkinked VCF file')
 
-    f('--msp', required=True, action='append', type=Path,
-      help='Path to ancestry calls MSP file')
+    # FLARE specific arguments
+    f = parser_flare.add_argument
+    f('vcf', type=str, help='Path to FLARE formatted VCF file')
 
-    f('--iids', type=Path,
-      help='IID file (one IID per line, no header)')
+    # Dosage / hapcount merging arguments
+    f = parser_merge.add_argument
+    f('files', type=Path, nargs='+', help='Input files to merge')
+    f('-o', '--output', type=Path, help='Output file for merge')
 
-#    # XXX: implement this? The results are different (annoyingly)
-#    f('--pre-merge', action=BooleanOptionalAction, default=False,
-#      help='Unkink MSP and VCF files *before* merging (if multiple given)')
+    f('--sort', action=BooleanOptionalAction, default=True,
+      help='Output merged inputs with columns sorted by IID')
 
-    f('--unkink-msp', action=BooleanOptionalAction, default=True,
-      help='Detect and correct strand flips in the RFMix MSP output')
+    f('--check-overlap', action=BooleanOptionalAction, default=True,
+      help='Raise an error if input IIDs overlap')
 
-    f('--unkink-geno', action=BooleanOptionalAction, default=True,
-      help='Detect and correct strand flips in the RFMix VCF output')
+    f('--check-index', action=BooleanOptionalAction, default=True,
+      help='Raise an error if input positions mismatch')
 
-    f('--extract', action=BooleanOptionalAction, default=True,
-      help='Extract tracts (requires --num-ancestors or --ancestors)')
+    # Arguments common to all extraction algos
+    for f in (parser_rfmix.add_argument, parser_flare.add_argument):
+        f('--ancestors', nargs='*', type=int,
+          help='Specific ancestral population(s) to extract')
+        f('--num-ancestors', type=int,
+          help='Number of ancestral population(s) to extract')
+        f('--stem', type=str, help='Output filename(s) stem')
 
-    f('--msp-compress', action=BooleanOptionalAction, default=False,
-      help='Assume the input MSP files are gzip compressed')
+    # CLI options common to all commands must be added to all parsers
+    for f in (p.add_argument for p in all_parsers):
+        f('--dry-run', type=BooleanOptionalAction,
+          help='Print parsed command line arguments and exit')
+        f('--outdir', type=Path,
+          help='Directory in which to write output files')
+        f('--vcf-gzip', action=BooleanOptionalAction, default=True,
+          help='Input VCF (or extracted tracts) are GZIP compressed')
+        f('--out-gzip', action=BooleanOptionalAction, default=True,
+          help='GZIP compress output files')
+        f('--gzip-threads', type=int, default=0,
+          help='Use multithreaded gzip if possible (default: no threads)')
+        f('--iids', type=Path,
+          help='Optional IID file to filter inputs. One per line, no header')
+        f('--header-char', action=BooleanOptionalAction, default=False,
+          help='Write or omit the leading "#" from the output header')
 
-    f('--vcf-compress', action=BooleanOptionalAction, default=True,
-      help='Assume the input VCF files are gzip compressed')
-
-    f('--buffer-input', action=BooleanOptionalAction, default=False,
-      help='Read the input files into memory before processing')
-
-    f('--buffer-output', action=BooleanOptionalAction, default=False,
-      help='Write the output files to a memory buffer before writing to disk')
-
-    f('--outdir', type=Path, default=Path().resolve(),
-      help='Directory in which to write outputs (created if non-existent)')
-
-    f('--ancestors', nargs='*', type=int,
-      help='Ancestral population(s) to extract from VCFs')
-
-    f('--num-ancestors', type=int,
-      help='Ancestral population(s) to extract from VCFs')
-
-    f('--write-msp-npz', action=BooleanOptionalAction, default=True,
-      help='Write Unkinked MSP and MSPSwitches as .npz files')
-
-    f('--write-vcf-npz', action=BooleanOptionalAction, default=True,
-      help='Write Unkinked Phased VCF as an .npz file')
-
-    f('--write-multi-anc-npz', action=BooleanOptionalAction, default=True,
-      help='Write extracted Ancestral tracts as a single .npz file')
-
-    f('--write-anc-tsv', action=BooleanOptionalAction, default=False,
-      help='Write each extracted Ancestral tracts as a .tsv file')
-
-    f('--write-anc-npz', action=BooleanOptionalAction, default=False,
-      help='Write each extracted Ancestral tracts as an .npz file')
-
-    f('--compress-ancs', action=BooleanOptionalAction, default=False,
-      help='Compress output ancestor *.tsv files (if writing any)')
-
-    f('--log', action='store_true', help='Write logs to stdout')
-    f('--log-file', help='Write logs to the given filename')
-    f('--dry-run', action='store_true', help='Log arguments and exit')
-
-    # Process the arguments
     args = parser.parse_args()
+    if args.dry_run:
+        pprint(vars(args))
+        return
+
+    #### Process all the common args first
     args.outdir.mkdir(parents=True, exist_ok=True)
 
-    if args.unkink_geno:
-        args.unkink_msp = True
-
-    if args.num_ancestors:
-        args.ancestors = list(range(args.num_ancestors))
-
-    if args.log or args.log_file:
-        if args.log_file:
-            filename = args.outdir/args.log_file
+    # Define a function for opening gzip files at the right level & threading
+    def gz_opener(name, mode, threads=args.gzip_threads):
+        if HAS_ISAL:
+            return gzip_open(name, mode, compresslevel=3, threads=threads)
         else:
-            # Logs to stream instead of file
-            filename = None
-        logging.basicConfig(filename=filename,
-                            level=logging.INFO,
-                            format='%(asctime)s %(name)s %(message)s',
-                            datefmt='%m/%d/%Y %I:%M:%S %p')
+            return gzip_open(name, mode, compresslevel=9)
 
-    # Pretty-print the arguments
-    nsdict = vars(args)
-    fmt = f'>{max(len(k) for k in nsdict)}s'
-    for key, val in sorted(nsdict.items()):
-        logging.info('%s: %s', format(key, fmt), val)
-
-    if args.dry_run:
-        return
-
-    #### Run the CLI App
-    if args.iids is not None:
-        logging.info(f'Reading IID file: {args.iids}')
-        iids = read_iids(args.iids)
+    # Determine if the inputs / outputs ought to use the gz_opener function
+    if args.vcf_gzip:
+        vcf_open = gz_opener
     else:
-        logging.info(f'Using IIDs in files')
-        iids = None
+        vcf_open = builtins.open
 
-    logging.info('Loading VCF file(s)')
-    kws = {'compress': args.vcf_compress, 'buffer': args.buffer_input}
-    if len(args.vcf) > 1:
-        vcf = PhasedVCF.from_tsv_set(args.vcf, args.iids, **kws)
+    if args.out_gzip:
+        suffix = '.gz'
+        out_open = gz_opener
     else:
-        vcf = PhasedVCF.from_tsv(args.vcf[0], **kws)
+        suffix = ''
+        out_open = builtins.open
 
-    logging.info('Loading MSP file(s)')
-    kws = {'compress': args.msp_compress, 'buffer': args.buffer_input}
-    msp = MSP.from_tsv(args.msp[0], **kws)
-    if iids is not None:
-        msp = msp.subset(iids)
-    for more_msp in args.msp[1:]:
-        new = MSP.from_tsv(more_msp, **kws)
-        if iids is not None:
-            new = new.subset(iids)
-        msp = msp.merge(new)
+    # If we must filter the input files to a given set of IIDs, read the
+    # cohort. NB: read_bytes() is pathilb.Path function (fun!)
+    if args.iids:
+        cohort = np.sort(args.iids.read_bytes().strip().split(b'\n'))
+    else:
+        cohort = None
 
-    logging.info('Checking that IIDs match between MSP and VCF')
-    if not np.all(msp.iids == vcf.iids):
-        raise RuntimeError('IID mismatch between MSP and VCF files')
+    #### Run the actual command
+    if args.command in ('extract_rfmix', 'extract_flare'):
+        # Process args common to both RFMix and Flare extraction first
+        # A specific list of ancestors is preferred to a number range
+        if args.ancestors:
+            ancestors = np.array(args.ancestors)
+        elif args.num_ancestors:
+            ancestors = np.arange(args.num_ancestors)
+        else:
+            raise RuntimeError('--ancestors or --num-ancestors is required')
 
-    if args.unkink_msp:
-        logging.info('Unkinking MSP')
-        msp, switches = unkink_msp(msp)
-        if args.write_msp_npz:
-            logging.info('Writing Unkinked MSP and Switches .npz files')
-            msp.to_npz(args.outdir/'unkinked_msp.npz')
-            switches.to_npz(args.outdir/'unkinked_msp_switches.npz')
+        # Use user stem if given; otherwise strip *all* suffices to get stem
+        if args.stem:
+            stem = args.stem
+        else:
+            if args.vcf == '-' or args.vcf == 'stdin':
+                raise RuntimeError('Cannot determine output file name stem')
+            p0 = Path(args.vcf)
+            while p0 != p0.with_suffix(''):
+                p0 = p0.with_suffix('')
+            stem = p0.stem
 
-    if args.unkink_geno:
-        logging.info('Unkinking Genotypes')
-        vcf = unkink_geno(vcf, switches)
-        if args.write_vcf_npz:
-            logging.info('Writing Unkinked Genotypes .npz file')
-            vcf.to_npz(args.outdir/'unkinked_vcf.npz')
+        # file names for the extracted hapcount / dosage files
+        hap_names = [f'{stem}.anc{i}.hapcount.txt{suffix}' for i in ancestors]
+        dos_names = [f'{stem}.anc{i}.dosage.txt{suffix}' for i in ancestors]
 
-    if not args.extract:
-        logging.info('DONE')
-        return
+        #### RFMix extraction stream: command is extract_rfmix
+        if args.command == 'extract_rfmix':
+            if args.msp_gzip:
+                msp_open = gz_opener
+            else:
+                msp_open = builtins.open
 
-    logging.info('Extracting tracts')
-    tract_data = extract_tracts(vcf, msp, args.ancestors, compat=False)
-    multi_ancs = MultiAncVCF(*tract_data)
+            vcf_stream = parse_vcf(read_file(args.vcf, opener=vcf_open), cohort)
+            msp_stream = parse_msp(read_file(args.msp, opener=msp_open), cohort)
 
-    if args.write_multi_anc_npz:
-        logging.info('Persisting tracts npz')
-        multi_ancs.to_npz(args.outdir/'all_ancestor_tracts.npz')
+            if args.unkink:
+                msp_stream = unkink_msp(msp_stream)
+                if args.emit_msp:
+                    msp_stream = write_msp(
+                        msp_stream,
+                        args.outdir/f'{stem}_unkinked.msp{suffix}',
+                        args.outdir/f'{stem}_switches.msp{suffix}',
+                        opener=out_open
+                    )
+                # The MSP file is iterated *twice* - once when unkinking and
+                # again when doing the extraction. So here we consume the
+                # interator so that we have an *iterable* to work with.
+                msp_data = list(msp_stream)
 
-    if args.write_anc_npz or args.write_anc_tsv:
-        tsv_kws = {'compress': args.compress_ancs,
-                   'buffer': args.buffer_output}
-        for anc in args.ancestors:
-            hap = multi_ancs.get_anc(anc, 'hapcount')
-            dos = multi_ancs.get_anc(anc, 'dosage')
-            if args.write_anc_npz:
-                logging.info(f'Writing anc {anc} hapcount npz')
-                hap.to_npz(args.outdir/f'anc{anc}_hapcount.npz')
+                vcf_stream = unkink_vcf(vcf_stream, iter(msp_data))
+                if args.emit_vcf:
+                    path = args.outdir/f'{stem}_unkinked.vcf{suffix}'
+                    vcf_stream = write_vcf(vcf_stream, path, opener=out_open)
 
-                logging.info(f'Writing anc {anc} dosage npz')
-                dos.to_npz(args.outdir/f'anc{anc}_dosage.npz')
+            stream = extract_rfmix(vcf_stream, iter(msp_data), ancestors)
 
-            if args.write_anc_tsv:
-                logging.info(f'Writing anc {anc} hapcount tsv')
-                hap.to_tsv(args.outdir/f'anc{anc}_hapcount.tsv', **tsv_kws)
+        #### FLARE extraction stream: command is extract_flare
+        else:
+            stream = read_file(args.vcf, opener=vcf_open)
+            stream = parse_vcf(stream, cohort=cohort, flare=True)
+            stream = extract_flare(stream, ancestors)
 
-                logging.info(f'Writing anc {anc} dosage tsv')
-                dos.to_tsv(args.outdir/f'anc{anc}_dosage.tsv', **tsv_kws)
-    logging.info('DONE')
+        #### Run the extraction (consume the `stream` determined just above)
+        try:
+            hap_files = [out_open(args.outdir/name, 'wb') for name in hap_names]
+            dos_files = [out_open(args.outdir/name, 'wb') for name in dos_names]
+            write_tracts(stream, hap_files, dos_files, args.header_char)
+        finally:
+            for fh in itertools.chain(hap_files, dos_files):
+                fh.close
+
+    elif args.command == 'merge_tracts':
+        merged = hstack_ancs(
+            streams=[
+                parse_anc(read_file(f, opener=vcf_open), cohort=cohort)
+                for f in args.files
+            ],
+            sort=args.sort,
+            check_overlap=args.check_overlap,
+            check_index=args.check_index,
+        )
+        write_anc(merged, filename=args.outdir/args.output, opener=out_open)
+
+    else:
+        raise RuntimeError('Unknown command')
 
 
 if __name__ == '__main__':
-    run_cli()
+    cli()

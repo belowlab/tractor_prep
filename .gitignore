@@ -1,7 +1,9 @@
 *.out
-nohup.out
+*.bak
 test_data/
 test_srcs/
+test_rfmix/
+test_flare/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
