@@ -1,5 +1,6 @@
 """
-Convert RFMix output MSPs and VCFs to Tractor input hapcount / dosage files.
+Convert RFMix or FLARE output files to ancestry specific hapcount and dosage
+files for downstream analysis by Tractor.
 """
 import builtins
 import contextlib
@@ -115,7 +116,7 @@ def parse_vcf(stream, cohort=None, flare=False):
 
 
 def parse_anc(stream, cohort=None):
-    """Parse and iterator of dosage / hapcount byte rows"""
+    """Parse an iterator of dosage (or hapcount) byte rows"""
     def header_fn(parts):
         return tuple(parts[:5]), np.array(parts[5:])
 
@@ -130,7 +131,7 @@ def parse_anc(stream, cohort=None):
 
 
 def unkink_msp(stream):
-    """Detect and correct strand flips in an RFMix MSP windows file.
+    """Detect and correct strand flips in an RFMix MSP file.
 
     The input stream is (index, call data) tuples.
     The output stream is (index, call data, switched flags) tuples.
@@ -147,16 +148,18 @@ def unkink_msp(stream):
     for idx, (a, b) in stream:
         start = np.float64(idx[3]) - 1.0
         egpos = np.float64(idx[4])
-        # copies have to be made so the switcheroo is not befuddled by mutation
+
         update_mask = (a != b)
         change_mask = (a != prev_a) | (b != prev_b)
         starts_mask = (start < prev_start)
         sm = (update_mask & change_mask & starts_mask)
         switched[sm] = np.logical_not(switched[sm])
+
         # Update state tracking ndarrays
         prev_start[update_mask] = egpos
         prev_a[update_mask] = a[update_mask]
         prev_b[update_mask] = b[update_mask]
+
         # Perform the switch
         a_out = np.where(switched, b, a)
         b_out = np.where(switched, a, b)
@@ -167,10 +170,9 @@ def _check_stream_iids(vcf_stream, msp_stream, check_iids=True):
     """Raise an error if the IIDs do not match"""
     vcf_head, vcf_iids = next(vcf_stream)
     msp_head, msp_iids = next(msp_stream)
-    # This is undefined if not the case. Use assert anyway?
     if check_iids and not np.all(vcf_iids == msp_iids):
         raise ValueError('VCF and MSP iids do not match')
-    return vcf_head, vcf_iids
+    return (vcf_head, vcf_iids), (msp_head, msp_iids)
 
 
 def unkink_vcf(vcf_stream, msp_stream, check_iids=True):
@@ -187,7 +189,7 @@ def unkink_vcf(vcf_stream, msp_stream, check_iids=True):
     Yields first (VCF field header tuple, VCF IID ndarray)
     Yields after that (idx, (geno_a, geno_b)
     """
-    yield _check_stream_iids(vcf_stream, msp_stream, check_iids=check_iids)
+    yield _check_stream_iids(vcf_stream, msp_stream, check_iids=check_iids)[0]
 
     windows = ((idx[0], int(idx[1]), int(idx[2]), switched)
                for idx, _, switched in iter(msp_stream))
@@ -219,11 +221,12 @@ def _hap_and_dos(geno_a, geno_b, call_a, call_b, call_grid):
 
 
 def extract_rfmix(vcf_stream, msp_stream, ancestors, check_iids=True):
-    vcf_head, vcf_iids = _check_stream_iids(vcf_stream, msp_stream, check_iids)
-    yield vcf_head, vcf_iids
-
+    """Extract tracts from RFMix VCF and MSP streams"""
+    idx, iids = _check_stream_iids(vcf_stream, msp_stream, check_iids)[0]
     ancestors = np.asarray(ancestors).reshape(-1, 1).astype(np.int8)
-    call_grid = np.tile(ancestors, len(vcf_iids))
+    call_grid = np.tile(ancestors, len(iids))
+    yield idx, iids
+    del idx, iids
 
     windows = ((idx[0], int(idx[1]), int(idx[2]), call_a, call_b)
                for idx, (call_a, call_b), *_ in iter(msp_stream))
@@ -246,44 +249,22 @@ def extract_rfmix(vcf_stream, msp_stream, ancestors, check_iids=True):
         if skip_line:
             continue
 
-#        # Get the haplotype counts
-#        call_grid_a = (call_a == call_grid)
-#        call_grid_b = (call_b == call_grid)
-#        hap_cts = call_grid_a.view(np.int8) + call_grid_b.view(np.int8)
-#
-#        # Get the dosage counts
-#        geno_grid_a = (geno_a.view(bool) & call_grid_a)
-#        geno_grid_b = (geno_b.view(bool) & call_grid_b)
-#        dos_cts = geno_grid_a.view(np.int8) + geno_grid_b.view(np.int8)
-
         hap, dos = _hap_and_dos(geno_a, geno_b, call_a, call_b, call_grid)
         yield idx, hap, dos
 
 
 def extract_flare(stream, ancestors):
+    """Extract tracts from FLARE VCF stream"""
     # Emit the header line, and learn the size of the call grid from it
     idx, iids = next(stream)
-    yield idx, iids
-
     ancestors = np.asarray(ancestors).reshape(-1, 1).astype(np.int8)
     call_grid = np.tile(ancestors, len(iids))
+    yield idx, iids
+    del idx, iids
 
+    # `calls` ought to have four rows (shape [4, n_iids]: see parse_anc)
+    # i.e.: >>> geno_a, geno_b, call_a, call_b = calls
     for (idx, calls) in stream:
-        #geno_a, geno_b, call_a, call_b = calls
-#        # XXX: This part of the algo is identical in both funcs. Should I
-#        # extract it? Will adding another layer of function call in this loop
-#        # affect the runtime very much at all?
-#
-#        # Get the haplotype counts
-#        call_grid_a = (call_a == call_grid)
-#        call_grid_b = (call_b == call_grid)
-#        hap_cts = call_grid_a.view(np.int8) + call_grid_b.view(np.int8)
-#
-#        # Get the dosage counts
-#        geno_grid_a = (geno_a.view(bool) & call_grid_a)
-#        geno_grid_b = (geno_b.view(bool) & call_grid_b)
-#        dos_cts = geno_grid_a.view(np.int8) + geno_grid_b.view(np.int8)
-        # `calls` ought to have four rows (shape [4, n_iids]: see parse_anc)
         hap, dos = _hap_and_dos(*calls, call_grid)
         yield idx, hap, dos
 
