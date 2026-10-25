@@ -234,7 +234,7 @@ def extract_rfmix(vcf_stream, msp_stream, ancestors, check_iids=True):
 
     for idx, (geno_a, geno_b) in vcf_stream:
         # First align the VCF and MSP: the VCF site must be in an MSP window
-        vcf_chrom, pos = str(idx[0]), int(idx[1])
+        vcf_chrom, pos = idx[0], int(idx[1])
         if vcf_chrom == msp_chrom and pos < start:
             continue
         skip_line = False
