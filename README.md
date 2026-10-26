@@ -1,6 +1,5 @@
 Tractor Prep
 ============
-
 A Python tool for creating `*.dosage.txt[.gz]` and `*.hapcount.txt[.gz]` files,
 from FLARE or RFMix outputs (VCF and MSP files), for downstream Tractor
 analysis. Three commands are exposed: `extract_rfmix`, `extract_flare`, and
@@ -24,9 +23,9 @@ and tract extraction are per-sample). The resulting files can then be merged by
 
 See `python -m tractor_prep --help` and the example scripts for usage.
 
+
 Performance
 -----------
-
 All commands are implemented as line-by-line stream filters. Therefore the
 memory overhead should be low.
 
@@ -37,9 +36,10 @@ processing is very efficient.
 Running the example test scripts using single-core processing, without gzip
 multi-threading, and ISAL installed:
 
-`test_tractor_prep_flare.sh` extracts from a VCF file for chr21 with approx.
-9000 rows and 250,000 samples in 5m46s. The directory of compressed outputs
-requires 2.5G disk space.
+`test_tractor_prep_flare.sh` extracts from a VCF file for chrom 21 with approx.
+9k rows and 250k samples in 5m46s. The directory of compressed outputs requires
+2.5G disk space. It extracts from a VCF file for chrom 1 with 49k rows and 250k
+samples in 29m25s.
 
 `test_tractor_prep_rfmix.sh` extracts from two VCF files, each with 1,117,575
 rows and a total of 35k samples between the two files. An IID file with 5015

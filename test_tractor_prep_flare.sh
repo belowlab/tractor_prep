@@ -2,7 +2,8 @@
 # Example usage and roundtrip test for extraction from FLARE outputs.
 set -euo pipefail
 
-CHROM="21"
+#CHROM="21"
+CHROM="1"
 STEM="agd_250k_chr${CHROM}_flare"
 
 time python -m tractor_prep extract_flare \
