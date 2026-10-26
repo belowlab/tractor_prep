@@ -178,7 +178,7 @@ def _check_stream_iids(vcf_stream, msp_stream, check_iids=True):
 def unkink_vcf(vcf_stream, msp_stream, check_iids=True):
     """
     Use switches and MSP windows from msp_stream to detect and correct strand
-    flips in a Phased Genotypes in vcf_stream (a parsed Phased VCF file).
+    flips in vcf_stream (a parsed Phased Genotypes VCF file).
 
     Arguments
     ---------
@@ -187,7 +187,7 @@ def unkink_vcf(vcf_stream, msp_stream, check_iids=True):
     check_iids: bool
 
     Yields first (VCF field header tuple, VCF IID ndarray)
-    Yields after that (idx, (geno_a, geno_b)
+    Yields after that (idx, (geno_a, geno_b))
     """
     yield _check_stream_iids(vcf_stream, msp_stream, check_iids=check_iids)[0]
 
