@@ -530,9 +530,9 @@ def cli():
 
         f('--iids', type=Path, help="""
             Optional IID file to filter inputs. The file must have one IID per
-            line and no header line. IIDs in this file missing from the inputs
-            are silently ignored. If provided, the IIDs are leically sorted,
-            and the output columns are therefore also sorted.
+            line and no header line. IIDs in this file which are missing from
+            the inputs are silently ignored. If provided, the IIDs are
+            lexically sorted, and the output columns are therefore also sorted.
         """)
 
     args = parser.parse_args()
@@ -618,9 +618,12 @@ def cli():
                 # The MSP file is iterated *twice* - once when unkinking and
                 # again when doing the extraction. So here we consume the
                 # interator so that we have an *iterable* to work with.
+                # NOTE: if --emit-msp, those files are written *now*
                 msp_data = list(msp_stream)
 
                 vcf_stream = unkink_vcf(vcf_stream, iter(msp_data))
+                # NOTE: if --emit-vcf, the VCF file writing is delayed until
+                # the `write_tracts` call below consumes all these iterators.
                 if args.emit_vcf:
                     path = args.outdir/f'{stem}_unkinked.vcf{suffix}'
                     vcf_stream = write_vcf(vcf_stream, path, opener=out_open)
