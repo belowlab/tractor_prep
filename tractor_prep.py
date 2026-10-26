@@ -501,7 +501,10 @@ def cli():
         f('--dry-run', type=BooleanOptionalAction,
           help='Print parsed command line arguments and exit')
 
-        f('--outdir', type=Path, required=True,
+        # This is required, but b/c of the way argparse works, listing it as
+        # required means it has to be listed on the command line before the
+        # command itself (extract_rfmix, extract_flare, etc), which is weird.
+        f('--outdir', type=Path,
           help='Directory in which to write all output files')
 
         f('--vcf-gzip', action=BooleanOptionalAction, default=True,
