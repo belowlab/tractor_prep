@@ -449,7 +449,9 @@ def cli():
 
     f('--emit-vcf', action=BooleanOptionalAction, default=True, help="""
         (default True) Write unkinked VCF file. File is written to `--outdir`
-        as `{stem}_unkinked.vcf[.gz]` (see also `--stem` and `--out-gzip`
+        as `{stem}_unkinked.vcf[.gz]` (see also `--stem` and `--out-gzip`. The
+        output VCF has QUAL, FILTER, INFO and FORMAT fields stripped (set to
+        the single character ".").
     """)
 
     # FLARE specific arguments
