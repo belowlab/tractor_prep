@@ -64,7 +64,7 @@ def parse_msp(stream, cohort=None):
         iids = np.array([x.strip().split(b'.')[0] for x in parts[6::2]])
         return tuple(parts[:6]), iids
 
-    for line in (next(stream), next(stream)):
+    for line in stream:
         if line.startswith(b'#Subpopulation'):
             pass
         elif line.startswith(b'#chm'):
