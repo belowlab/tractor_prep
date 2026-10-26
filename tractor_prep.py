@@ -346,7 +346,7 @@ def hstack_ancs(streams, sort=True, check_overlap=True, check_index=True):
 
 def write_msp(stream, msp_name, switch_name, opener=builtins.open):
     """Write unkinked MSP stream to file and forward to consumer function."""
-    # XXX: function is assumed to be called with unkink_msp stream as input
+    # NOTE: function is assumed to be called with unkink_msp stream as input
     with opener(msp_name, 'wb') as file, opener(switch_name, 'wb') as sw_file:
         # Write the MSP header, ignoring the Subpopulations header
         fields, iids = next(stream)
@@ -432,16 +432,25 @@ def cli():
 
     # RFMix specific arguments
     f = parser_rfmix.add_argument
-    f('vcf', type=str, help='Path to Phased VCF genotypes file')
+    f('vcf', type=str, help='Path to Phased VCF Genotypes file')
     f('--msp', type=Path, help='Path to RFMix MSP file')
+
     f('--msp-gzip', action=BooleanOptionalAction, default=False,
-      help='Input MSP is GZIP compressed')
+      help='(default False) Treat MSP input as gzip compressed')
+
     f('--unkink', action=BooleanOptionalAction, default=True,
-      help='Correct RFMix strand flips')
-    f('--emit-msp', action=BooleanOptionalAction, default=True,
-      help='Write unkinked MSP file')
-    f('--emit-vcf', action=BooleanOptionalAction, default=True,
-      help='Write unkinked VCF file')
+      help='(default True) Correct RFMix strand flips in MSP and VCF files')
+
+    f('--emit-msp', action=BooleanOptionalAction, default=True, help="""
+        (default True) Write unkinked MSP file and MSP Switches file. Files are
+        written to `--outdir` as `{stem}_unkinked.msp[.gz]` and
+        `{stem}_switches.msp[.gz]` (see also `--stem` and `--out-gzip`)
+    """)
+
+    f('--emit-vcf', action=BooleanOptionalAction, default=True, help="""
+        (default True) Write unkinked VCF file. File is written to `--outdir`
+        as `{stem}_unkinked.vcf[.gz]` (see also `--stem` and `--out-gzip`
+    """)
 
     # FLARE specific arguments
     f = parser_flare.add_argument
@@ -453,38 +462,73 @@ def cli():
     f('-o', '--output', type=Path, help='Output file for merge')
 
     f('--sort', action=BooleanOptionalAction, default=True,
-      help='Output merged inputs with columns sorted by IID')
+      help='(default True) Sort merged output by sample IIDs')
 
     f('--check-overlap', action=BooleanOptionalAction, default=True,
-      help='Raise an error if input IIDs overlap')
+      help='(default True) Raise an error if the input file IIDs overlap')
 
-    f('--check-index', action=BooleanOptionalAction, default=True,
-      help='Raise an error if input positions mismatch')
+    f('--check-index', action=BooleanOptionalAction, default=True, help="""
+        (default True) Raise an error if input file rows mismatch on CHROM,
+        'POS, ID, REF, or ALT fields.
+    """)
 
-    # Arguments common to all extraction algos
+    # Arguments common to both RFMix and FLARE
     for f in (parser_rfmix.add_argument, parser_flare.add_argument):
-        f('--ancestors', nargs='*', type=int,
-          help='Specific ancestral population(s) to extract')
-        f('--num-ancestors', type=int,
-          help='Number of ancestral population(s) to extract')
-        f('--stem', type=str, help='Output filename(s) stem')
+        f('--ancestors', nargs='*', type=int, help="""
+            Specific ancestral population(s) to extract. E.g., `--ancestors 0
+            3` would output dosage and hapcount files for only population codes
+            `0` and `3`. See `--num-ancestors` for filename format.
+        """)
+
+        f('--num-ancestors', type=int, help="""
+            Number (0..N) of ancestral population(s) to extract. E.g.,
+            `--num-ancestors=6` will extract codes `[0, 1, 2, 3, 4, 5]. Output
+            files are written to `--outdir` with filenames formatted as
+            `{stem}.anc{i}.hapcount.txt[.gz]` and
+            `{stem}.anc{i}.dosage.txt[.gz]`. See `--stem` and `--out-gzip`.
+        """)
+
+        f('--stem', type=str, help="""
+            Output filename stem. If not provided, the input VCF filename is
+            used, stripped of all suffixes. I.e., the stem taken from
+            `phased_chr1.vcf.gz` is `phased_chr`.
+        """)
 
     # CLI options common to all commands must be added to all parsers
     for f in (p.add_argument for p in all_parsers):
         f('--dry-run', type=BooleanOptionalAction,
           help='Print parsed command line arguments and exit')
-        f('--outdir', type=Path,
-          help='Directory in which to write output files')
+
+        f('--outdir', type=Path, required=True,
+          help='Directory in which to write all output files')
+
         f('--vcf-gzip', action=BooleanOptionalAction, default=True,
-          help='Input VCF (or extracted tracts) are GZIP compressed')
-        f('--out-gzip', action=BooleanOptionalAction, default=True,
-          help='GZIP compress output files')
-        f('--gzip-threads', type=int, default=0,
-          help='Use multithreaded gzip if possible (default: no threads)')
-        f('--iids', type=Path,
-          help='Optional IID file to filter inputs. One per line, no header')
+          help='(default True) Treat input VCF as gzip compressed')
+
+        f('--out-gzip', action=BooleanOptionalAction, default=True, help="""
+            (default True) Gzip compress all output files. Uses highest
+            compression level. Uses ISAL if installed.
+        """)
+
+        f('--gzip-threads', type=int, default=0, help="""
+            Use multiple threads for gzip compression. Requires ISAL. Default:
+            single-threaded. NOTE: decompression does not benefit from extra
+            threads, and thread communication overhead may, depending on input,
+            make multiple threads slower than the default.
+        """)
+
         f('--header-char', action=BooleanOptionalAction, default=False,
-          help='Write or omit the leading "#" from the output header')
+          help="""
+            (Default False) Prefix output dosage and hapcount file header lines
+            with a '#' character.
+        """)
+
+        f('--iids', type=Path, help="""
+            Optional IID file to filter inputs. The file must have one IID per
+            line and no header line. IIDs in this file missing from the inputs
+            are silently ignored. If provided, the IIDs are leically sorted,
+            and the output columns are therefore also sorted.
+        """)
 
     args = parser.parse_args()
     if args.dry_run:
