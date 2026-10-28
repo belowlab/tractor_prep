@@ -47,12 +47,14 @@ def bytes_to_ords(bts, *, cols=Ellipsis, rows=4, stride=2):
     return bts
 
 
-def process_iid_header(line, splitfn, cohort=None):
+def process_iid_header(line, splitfn, cohort=None, raise_if_no_overlap=True):
     """Process the header line into fields, iids, and iid cohort col indices"""
     index, iids = splitfn(line.strip().split(b'\t'))
     if cohort is not None:
         _, cols, _ = np.intersect1d(iids, cohort, return_indices=True)
         iids = np.copy(iids[cols], order='c')
+        if raise_if_no_overlap and len(iids) == 0:
+            raise RuntimeError('No cohort IDs found in sample IDs')
     else:
         cols = Ellipsis
     return index, iids, cols

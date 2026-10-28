@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tractor_prep"
+version = "10.28.2026"
+description = "Accelerated preprocessing of LAI outputs for Tractor analysis"
+dependencies = ["numpy"]
+authors = [
+    {name = "John Still", email = "john.m.still@vumc.org"},
+]
+maintainers = [
+    {name = "John Still", email = "john.m.still@vumc.org"},
+]
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+
+[tool.setuptools]
+py-modules = ["tractor_prep"]
+
+[project.optional-dependencies]
+isal = ["isal"]
+
+[project.scripts]
+tractor-prep = "tractor_prep:cli"
+
+[project.urls]
+Repository = "https://github.com/belowlab/tractor_prep.git"
