@@ -7,7 +7,5 @@ TODO / Questions
 2. 2-way admixtures: Atkinson's GH says unkinking is only implemented for 2-way
    admixtures. Are the outputs _wrong_ if we run the unkinking algo on inputs
    with more populations? If so, what needs to change to make them correct?
-3. Investigate using bgzip for ins/outs and automatically tab-indexing outputs.
-4. Write an install script / pyproject.toml for `pip install [-e] .`
-5. The original `extract_tracts.py` script can output "ancestry specific VCF"
+3. The original `extract_tracts.py` script can output "ancestry specific VCF"
    files - should we add this functionality back in?
