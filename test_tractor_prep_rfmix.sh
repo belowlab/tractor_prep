@@ -27,7 +27,7 @@ function run_extraction() {
         --unkink \
         --emit-msp \
         --emit-vcf \
-        --iids "$IIDS"
+        --cohort "$IIDS"
 }
 
 function run_merge() {

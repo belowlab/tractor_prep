@@ -530,7 +530,7 @@ def cli():
             with a '#' character.
         """)
 
-        f('--iids', type=Path, help="""
+        f('--cohort', '--iids', type=Path, help="""
             Optional IID file to filter inputs. The file must have one IID per
             line and no header line. IIDs in this file which are missing from
             the inputs are silently ignored. If provided, the IIDs are
@@ -567,8 +567,8 @@ def cli():
 
     # If we must filter the input files to a given set of IIDs, read the
     # cohort. NB: read_bytes() is pathilb.Path function (fun!)
-    if args.iids:
-        cohort = np.sort(args.iids.read_bytes().strip().split(b'\n'))
+    if args.cohort:
+        cohort = np.sort(args.cohort.read_bytes().strip().split(b'\n'))
     else:
         cohort = None
 
