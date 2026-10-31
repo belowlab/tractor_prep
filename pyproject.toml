@@ -14,7 +14,6 @@ maintainers = [
     {name = "John Still", email = "john.m.still@vumc.org"},
 ]
 readme = "README.md"
-license = "MIT"
 license-files = ["LICENSE"]
 
 [tool.setuptools]

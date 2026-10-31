@@ -24,27 +24,13 @@ and tract extraction are per-sample). The resulting files can then be merged by
 See `python -m tractor_prep --help` and the example scripts for usage.
 
 
-Performance
+Attribution
 -----------
-All commands are implemented as line-by-line stream filters. Therefore the
-memory overhead should be low.
+The functionality implemented here was developed and first implemented by
+Atkinson Lab. Please see [https://github.com/Atkinson-Lab/Tractor].
 
-Under the assumption that input VCF files have fixed-width formats for the
-sample information (i.e. `GT` for RFMix and `GT:AN1:AN2` for FLARE), line
-processing is very efficient.
-
-Running the example test scripts using single-core processing, without gzip
-multi-threading, and ISAL installed:
-
-`test_tractor_prep_flare.sh` extracts from a VCF file for chrom 21 with approx.
-9k rows and 250k samples in 5m46s. The directory of compressed outputs requires
-2.5G disk space. It extracts from a VCF file for chrom 1 with 49k rows and 250k
-samples in 29m25s.
-
-`test_tractor_prep_rfmix.sh` extracts from two VCF files, each with 1,117,575
-rows and a total of 35k samples between the two files. An IID file with 5015
-IIDs was used. The pt1 file is filtered to 3006 samples, and the pt2 is
-filtered down to 2409. The MSP and VCF files are unkinked and written to disk.
-Pt1 was processed in 15m23s, pt2 in 12m48s. The resulting six sets of pt1/pt2
-output files were merged in between 2 and 3.5 minutes each. The compressed
-outputs require 7.5G total.
+If you use Tractor in your research, please cite the following article:
+> Atkinson, E.G., Maihofer, A.X., Kanai, M. et al. Tractor uses local ancestry
+> to enable the inclusion of admixed individuals in GWAS and to boost power.
+> Nat Genet 53, 195–204 (2021).
+> [Link](https://doi.org/10.1038/s41588-020-00766-y)
