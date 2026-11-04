@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tractor_prep"
-version = "10.28.2026"
+version = "11.04.2026"
 description = "Accelerated preprocessing of LAI outputs for Tractor analysis"
 dependencies = ["numpy"]
 authors = [
@@ -17,10 +17,11 @@ readme = "README.md"
 license-files = ["LICENSE"]
 
 [tool.setuptools]
-py-modules = ["tractor_prep"]
+py-modules = ["tractor_prep", "msp_to_vcf"]
 
 [project.optional-dependencies]
 isal = ["isal"]
+pysam = ["pysam"]
 
 [project.scripts]
 tractor-prep = "tractor_prep:cli"

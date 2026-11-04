@@ -24,6 +24,13 @@ and tract extraction are per-sample). The resulting files can then be merged by
 See `python -m tractor_prep --help` and the example scripts for usage.
 
 
+#### msp_to_vcf
+A small utility to transform RFMix style outputs (VCF and MSP combination) into
+a single FLARE style VCF; i.e. with `AN1` and `AN2` fields in the `FORMAT`.
+Operates on VCF files with arbitrary `FORMAT` fields. Requires `pysam`
+installed.
+
+
 Attribution
 -----------
 The functionality implemented here was developed and first implemented by

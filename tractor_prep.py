@@ -60,7 +60,7 @@ def process_iid_header(line, splitfn, cohort=None, raise_if_no_overlap=True):
     return index, iids, cols
 
 
-def parse_msp(stream, cohort=None):
+def parse_msp(stream, cohort=None, parse_subpops=False):
     """Parse an iterator of newline-terminated byte as MSP window data"""
     def header_fn(parts):
         iids = np.array([x.strip().split(b'.')[0] for x in parts[6::2]])
@@ -68,7 +68,9 @@ def parse_msp(stream, cohort=None):
 
     for line in stream:
         if line.startswith(b'#Subpopulation'):
-            pass
+            if parse_subpops:
+                import re
+                yield re.findall(rb'(\w+)=(\d)', line.strip())
         elif line.startswith(b'#chm'):
             index, iids, cols = process_iid_header(line, header_fn, cohort)
             yield index, iids
