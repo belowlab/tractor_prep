@@ -497,7 +497,7 @@ def cli():
         f('--stem', type=str, help="""
             Output filename stem. If not provided, the input VCF filename is
             used, stripped of all suffixes. I.e., the stem taken from
-            `phased_chr1.vcf.gz` is `phased_chr`.
+            `phased_chr1.vcf.gz` is `phased_chr1`.
         """)
 
     # CLI options common to all commands must be added to all parsers
