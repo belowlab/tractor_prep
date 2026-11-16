@@ -623,16 +623,16 @@ def cli():
                 # again when doing the extraction. So here we consume the
                 # interator so that we have an *iterable* to work with.
                 # NOTE: if --emit-msp, those files are written *now*
-                msp_data = list(msp_stream)
+                msp_stream = list(msp_stream)
 
-                vcf_stream = unkink_vcf(vcf_stream, iter(msp_data))
+                vcf_stream = unkink_vcf(vcf_stream, iter(msp_stream))
                 # NOTE: if --emit-vcf, the VCF file writing is delayed until
                 # the `write_tracts` call below consumes all these iterators.
                 if args.emit_vcf:
                     path = args.outdir/f'{stem}_unkinked.vcf{suffix}'
                     vcf_stream = write_vcf(vcf_stream, path, opener=out_open)
 
-            stream = extract_rfmix(vcf_stream, iter(msp_data), ancestors)
+            stream = extract_rfmix(vcf_stream, iter(msp_stream), ancestors)
 
         #### FLARE extraction stream: command is extract_flare
         else:
